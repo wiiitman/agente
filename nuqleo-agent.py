@@ -279,12 +279,14 @@ class NuqleoHandler(BaseHTTPRequestHandler):
             parts = r['stdout'].strip().split('\t')
             state  = parts[0]  # running, exited, restarting, etc.
             health = parts[1] if len(parts) > 1 else ''
-            # Verificar si Odoo responde en su puerto (conexión TCP rápida)
-            port_r = run(['docker', 'inspect', '--format', '{{range $p, $c := .NetworkSettings.Ports}}{{$p}}{{end}}', cname])
+            # Verificar si Odoo responde en su puerto (conexión TCP al puerto del HOST)
+            port_r = run(['docker', 'inspect', '--format',
+                          '{{range $p, $c := .NetworkSettings.Ports}}{{range $c}}{{.HostPort}} {{end}}{{end}}',
+                          cname])
             odoo_port = None
             if port_r['ok']:
                 import re as _re
-                m = _re.search(r'(\d+)/tcp', port_r['stdout'])
+                m = _re.search(r'(\d+)', port_r['stdout'])
                 if m:
                     odoo_port = int(m.group(1))
             web_ready = False
