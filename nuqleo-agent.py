@@ -291,6 +291,22 @@ def run(cmd: list | str, timeout=120) -> dict:
     }
 
 
+def _parse_mem_to_mb(s: str) -> float:
+    """Convierte un valor de docker stats (ej. '691MiB', '1.27GiB') a MB numéricos.
+    Necesario porque MemUsage solo viene como string 'usado / límite' — sin esto
+    no había forma de comparar el uso real de RAM contra la cuota vendida al
+    cliente (nuqleo_check_ram_quotas() en el plugin)."""
+    s = s.strip()
+    m = re.match(r'([\d.]+)\s*(GiB|MiB|KiB|GB|MB|KB|B)', s, re.IGNORECASE)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit in ('gib', 'gb'): return round(val * 1024, 1)
+    if unit in ('mib', 'mb'): return round(val, 1)
+    if unit in ('kib', 'kb'): return round(val / 1024, 1)
+    return round(val / (1024 * 1024), 1)
+
 def _container_resources(cname: str) -> dict:
     """RAM/CPU en vivo (docker stats, una sola muestra) + disco usado por los datos
     de esta instancia + disco total del VPS. Todo con timeouts cortos porque el
@@ -321,6 +337,22 @@ def _container_resources(cname: str) -> dict:
     if db_bytes.strip().isdigit():
         db_mb = round(int(db_bytes.strip()) / (1024 * 1024), 1)
 
+    # Snapshots MANUALES (creados a pedido del cliente desde el botón "Backups")
+    # cuentan contra su cupo de disco — los automáticos nocturnos NO, son overhead
+    # de la plataforma. Por eso se suman aparte y solo se filtran los 'manual-*'.
+    manual_snap_mb = 0.0
+    snap_root = os.path.join(SNAPSHOT_ROOT, cname)
+    if os.path.isdir(snap_root):
+        total_bytes = 0
+        for d in os.listdir(snap_root):
+            if not d.startswith('manual-'):
+                continue
+            for fn in ('db.sql', 'addons.tar.gz', 'odoo-data.tar.gz'):
+                fp = os.path.join(snap_root, d, fn)
+                if os.path.exists(fp):
+                    total_bytes += os.path.getsize(fp)
+        manual_snap_mb = round(total_bytes / (1024 * 1024), 1)
+
     disk_server = {}
     df = run(['df', '-BM', '--output=used,size,pcent', '/'], timeout=10)
     if df['ok']:
@@ -334,13 +366,17 @@ def _container_resources(cname: str) -> dict:
                     'pct':      vals[2].rstrip('%'),
                 }
 
+    mem_used_mb = _parse_mem_to_mb(mem_usage.split('/')[0]) if mem_usage else 0.0
+
     return {
         'cpu_pct':      cpu_pct,
         'mem_usage':    mem_usage,
         'mem_pct':      mem_pct,
+        'mem_used_mb':  mem_used_mb,
         'disk_mb':      round(disk_mb, 1),
         'db_mb':        db_mb,
-        'client_total_mb': round(disk_mb + db_mb, 1),
+        'manual_snapshot_mb': manual_snap_mb,
+        'client_total_mb': round(disk_mb + db_mb + manual_snap_mb, 1),
         'disk_server':  disk_server,
     }
 
@@ -1337,6 +1373,40 @@ def _create_daily_snapshot(container: str) -> bool:
         log(f'[snapshot] {container}: snapshot de {date_str} creado')
     return ok_db
 
+def _create_manual_snapshot(container: str):
+    """Snapshot manual bajo demanda del cliente (botón 'Crear snapshot ahora' en
+    /plataforma). A diferencia del automático nocturno (gratis, no cuenta contra el
+    cupo), este SÍ suma a client_total_mb en _container_resources() porque el cliente
+    lo pidió explícitamente. Se identifica con prefijo 'manual-' para no pisar el
+    snapshot diario del mismo día y se purga solo a los SNAPSHOT_RETENTION_DAYS días
+    igual que los automáticos (ver _prune_old_snapshots)."""
+    db_name    = _derive_db_name(container)
+    deploy_dir = os.path.join(ODOO_DIR, container)
+    addons_dir = os.path.join(deploy_dir, 'addons')
+    data_dir   = os.path.join(deploy_dir, 'odoo-data')
+    if not os.path.isdir(deploy_dir):
+        return None, 'Deployment no encontrado'
+
+    import datetime
+    snap_id  = 'manual-' + datetime.datetime.utcnow().strftime('%Y-%m-%d-%H%M%S')
+    snap_dir = os.path.join(SNAPSHOT_ROOT, container, snap_id)
+    os.makedirs(snap_dir, exist_ok=True)
+
+    ok_db = _pg_dump_db(db_name, os.path.join(snap_dir, 'db.sql'))
+    if os.path.isdir(addons_dir):
+        run(f'tar --exclude=__pycache__ -czf {os.path.join(snap_dir, "addons.tar.gz")} -C {deploy_dir} addons',
+            timeout=300)
+    if os.path.isdir(data_dir):
+        run(f'tar -czf {os.path.join(snap_dir, "odoo-data.tar.gz")} -C {deploy_dir} odoo-data', timeout=300)
+
+    if not ok_db:
+        run(f'rm -rf {snap_dir}')
+        log(f'[snapshot] {container}: snapshot manual falló (pg_dump)')
+        return None, 'No se pudo generar el snapshot (falló el respaldo de la base de datos)'
+
+    log(f'[snapshot] {container}: snapshot manual {snap_id} creado a pedido del cliente')
+    return snap_id, None
+
 def _prune_old_snapshots(container: str):
     import datetime
     root = os.path.join(SNAPSHOT_ROOT, container)
@@ -1344,8 +1414,10 @@ def _prune_old_snapshots(container: str):
         return
     cutoff = datetime.datetime.utcnow().date() - datetime.timedelta(days=SNAPSHOT_RETENTION_DAYS)
     for name in os.listdir(root):
+        m = re.match(r'^manual-(\d{4}-\d{2}-\d{2})-\d{6}$', name)
+        date_part = m.group(1) if m else name
         try:
-            d = datetime.datetime.strptime(name, '%Y-%m-%d').date()
+            d = datetime.datetime.strptime(date_part, '%Y-%m-%d').date()
         except ValueError:
             continue
         if d < cutoff:
@@ -1794,14 +1866,20 @@ class NuqleoHandler(BaseHTTPRequestHandler):
             items = []
             if os.path.isdir(root):
                 for d in sorted(os.listdir(root), reverse=True):
-                    if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+                    m_manual = re.match(r'^manual-(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})(\d{2})$', d)
+                    if re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+                        snap_type, date_label = 'auto', d
+                    elif m_manual:
+                        snap_type = 'manual'
+                        date_label = f'{m_manual.group(1)} {m_manual.group(2)}:{m_manual.group(3)}'
+                    else:
                         continue
                     size = 0
                     for fn in ('db.sql', 'addons.tar.gz', 'odoo-data.tar.gz'):
                         fp = os.path.join(root, d, fn)
                         if os.path.exists(fp):
                             size += os.path.getsize(fp)
-                    items.append({'date': d, 'size_mb': round(size / (1024 * 1024), 1)})
+                    items.append({'id': d, 'date': date_label, 'type': snap_type, 'size_mb': round(size / (1024 * 1024), 1)})
             self._send(200, {'ok': True, 'snapshots': items, 'retention_days': SNAPSHOT_RETENTION_DAYS})
 
         else:
@@ -1837,6 +1915,7 @@ class NuqleoHandler(BaseHTTPRequestHandler):
         elif path == '/setup-postgres':   self._handle_setup_postgres(body)
         elif path == '/backup':           self._handle_backup(body)
         elif path == '/snapshot-restore': self._handle_snapshot_restore(body)
+        elif path == '/snapshot-create':  self._handle_snapshot_create(body)
         else:                             self._send(404, {'error': 'Endpoint no encontrado'})
 
     # ── Setup Postgres compartido ─────────────────────────────────
@@ -2004,12 +2083,22 @@ class NuqleoHandler(BaseHTTPRequestHandler):
 
         self._send(200, {'ok': True, **result})
 
-    # ── Restaurar snapshot diario a una fecha específica ─────────
+    # ── Crear snapshot manual bajo demanda ────────────────────────
+    def _handle_snapshot_create(self, body: dict):
+        name = _sanitize_name(body.get('container_name', ''))
+        if not name:
+            return self._send(400, {'error': 'container_name requerido'})
+        snap_id, err = _create_manual_snapshot(name)
+        if err:
+            return self._send(500, {'ok': False, 'error': err})
+        self._send(200, {'ok': True, 'id': snap_id})
+
+    # ── Restaurar snapshot (diario automático o manual) a un punto concreto ──
     def _handle_snapshot_restore(self, body: dict):
         name     = _sanitize_name(body.get('container_name', ''))
-        date_str = re.sub(r'[^0-9\-]', '', str(body.get('date', '')))[:10]
-        if not name or not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
-            return self._send(400, {'error': 'container_name y date (YYYY-MM-DD) requeridos'})
+        date_str = re.sub(r'[^0-9a-zA-Z\-]', '', str(body.get('date', '')))[:32]
+        if not name or not re.match(r'^(\d{4}-\d{2}-\d{2}|manual-\d{4}-\d{2}-\d{2}-\d{6})$', date_str):
+            return self._send(400, {'error': 'container_name y date/id de snapshot inválidos'})
 
         snap_dir = os.path.join(SNAPSHOT_ROOT, name, date_str)
         if not os.path.isdir(snap_dir):
