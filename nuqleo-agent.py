@@ -429,6 +429,42 @@ def _sync_custom_modules() -> bool:
     return False
 
 
+def _resolve_custom_module_deps(mod_list: list, version: str) -> list:
+    """Expande mod_list agregando, para cada módulo propio (repo custom) ya
+    presente, sus dependencias declaradas en __manifest__.py que TAMBIÉN sean
+    módulos propios (existen como carpeta en el repo). Las dependencias core de
+    Odoo (account, sale, l10n_co...) no se tocan — Odoo las resuelve solo."""
+    import ast
+    src = os.path.join(MODULES_DIR, str(version))
+    if not os.path.isdir(src):
+        _sync_custom_modules()
+    if not os.path.isdir(src):
+        return mod_list
+
+    result = list(mod_list)
+    seen   = set(result)
+    queue  = list(result)
+    while queue:
+        m = queue.pop(0)
+        manifest_path = os.path.join(src, m, '__manifest__.py')
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, encoding='utf-8') as f:
+                manifest = ast.literal_eval(f.read())
+        except Exception as e:
+            log(f'[modules] no se pudo leer __manifest__.py de {m}: {e}')
+            continue
+        for dep in manifest.get('depends', []):
+            if dep in seen:
+                continue
+            if os.path.isfile(os.path.join(src, dep, '__manifest__.py')):
+                seen.add(dep)
+                result.append(dep)
+                queue.append(dep)
+    return result
+
+
 OM_ACCOUNT_REPO  = 'https://github.com/odoomates/odooapps.git'
 OM_ACCOUNT_CACHE = '/opt/nuqleo-modulos/om_account'  # caché local por versión
 
@@ -2071,8 +2107,26 @@ class NuqleoHandler(BaseHTTPRequestHandler):
             log(f'[backup] {name}: pg_dump falló: {pg["stderr"][:300]}')
             sql_file = None
 
-        # 2) Tar del directorio de addons/filestore (excluimos __pycache__)
-        run(f'tar --exclude=__pycache__ -czf {tar_path} -C {ODOO_DIR} {name}', timeout=300)
+        # 2) Tar de addons/filestore + el dump.sql en el mismo archivo (antes solo
+        #    se descargaba el tar, sin la BD — un "backup" que no incluía la base
+        #    de datos no servía para restaurar nada). Los módulos PROPIOS (repo
+        #    privado de Nuqleo) se EXCLUYEN a propósito: el cliente paga por
+        #    hospedarlos/usarlos, no por llevarse su código fuente (para eso existe
+        #    /store/download-module). Los módulos que el cliente subió con "Módulo"
+        #    son su propio código y sí quedan incluidos.
+        excludes = '--exclude=__pycache__'
+        version  = _get_odoo_version(name)
+        if MODULES_REPO and version:
+            custom_src = os.path.join(MODULES_DIR, version)
+            if os.path.isdir(custom_src):
+                for entry in os.listdir(custom_src):
+                    if os.path.isfile(os.path.join(custom_src, entry, '__manifest__.py')):
+                        excludes += f' --exclude={name}/addons/{entry}'
+
+        tar_cmd = f'tar {excludes} -czf {tar_path} -C {ODOO_DIR} {name}'
+        if sql_file and os.path.exists(sql_file):
+            tar_cmd += f' -C {bak_dir} {db_name}.sql'
+        run(tar_cmd, timeout=300)
 
         # 3) Tamaño legible
         size_str = ''
@@ -2425,15 +2479,17 @@ networks:
             if MODULES_REPO:
                 mod_list.extend(['company_welcome_wizard', 'ss_enterprise_theme'])
 
-            # Exógena DIAN (l10n_co_exogena) depende de l10n_co_edi_community, un
-            # módulo propio del mismo repo — aunque su carpeta se copia igual a
-            # addons (ver 5b más abajo), _install_modules_rpc solo llama
+            # Cualquier módulo propio (repo custom) que dependa de OTRO módulo propio
+            # necesita que ese hermano también esté en mod_list: aunque su carpeta se
+            # copia igual a addons (ver 5b más abajo), _install_modules_rpc solo llama
             # button_immediate_install sobre los ids que caen dentro de mods_list
-            # (name in mods_list), así que si el cliente no seleccionó también
-            # l10n_co_edi_community, Odoo nunca recibe la orden de instalarlo y
-            # exógena se queda "to install" sin poder resolver su dependencia.
-            if 'l10n_co_exogena' in mod_list and 'l10n_co_edi_community' not in mod_list:
-                mod_list.append('l10n_co_edi_community')
+            # (name in mods_list) — si el cliente no seleccionó también la dependencia,
+            # Odoo nunca recibe la orden de instalarla y el módulo pedido se queda
+            # "to install" sin poder resolverla (ej: l10n_co_exogena → l10n_co_edi_community).
+            # Las dependencias CORE de Odoo (account, sale, l10n_co...) no necesitan esto:
+            # Odoo ya las resuelve solo con button_immediate_install.
+            if MODULES_REPO:
+                mod_list = _resolve_custom_module_deps(mod_list, version)
 
             mod_list = list(dict.fromkeys(mod_list))  # dedupe, conserva orden
 
