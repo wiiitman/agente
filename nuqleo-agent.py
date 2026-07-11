@@ -2314,6 +2314,16 @@ networks:
             if MODULES_REPO:
                 mod_list.extend(['company_welcome_wizard', 'ss_enterprise_theme'])
 
+            # Exógena DIAN (l10n_co_exogena) depende de l10n_co_edi_community, un
+            # módulo propio del mismo repo — aunque su carpeta se copia igual a
+            # addons (ver 5b más abajo), _install_modules_rpc solo llama
+            # button_immediate_install sobre los ids que caen dentro de mods_list
+            # (name in mods_list), así que si el cliente no seleccionó también
+            # l10n_co_edi_community, Odoo nunca recibe la orden de instalarlo y
+            # exógena se queda "to install" sin poder resolver su dependencia.
+            if 'l10n_co_exogena' in mod_list and 'l10n_co_edi_community' not in mod_list:
+                mod_list.append('l10n_co_edi_community')
+
             mod_list = list(dict.fromkeys(mod_list))  # dedupe, conserva orden
 
             if MODULES_REPO and mod_list:
