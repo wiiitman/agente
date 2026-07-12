@@ -50,6 +50,13 @@ SHARED_PG_ADMIN = 'postgres'   # superusuario para gestión interna
 SHARED_PG_USER  = 'odoo'       # rol que usa Odoo (no 'postgres' — Odoo lo rechaza)
 _pg_lock = threading.Lock()
 
+# ── Acceso BI externo (Power BI / Excel) ─────────────────────────
+# El Postgres compartido corre sin puerto publicado; para que un cliente conecte
+# Power BI se publica vía un proxy socat en BI_PROXY_PORT (ver _ensure_bi_proxy)
+# y se le crea un rol de SOLO LECTURA limitado a su propia base.
+BI_PROXY_NAME = 'nuqleo_bi_proxy'
+BI_PROXY_PORT = 5433
+
 # ── Rate limiting ────────────────────────────────────────────────
 _rate_lock   = threading.Lock()
 _fail_counts = defaultdict(list)   # ip → [timestamps de fallos]
@@ -164,6 +171,30 @@ def _template_exists(version: str) -> bool:
 def _pg_query_db(dbname: str, sql: str) -> str:
     r = run(['docker', 'exec', SHARED_PG_NAME, 'psql', '-U', SHARED_PG_ADMIN, '-d', dbname, '-tAc', sql])
     return r['stdout'].strip() if r['ok'] else ''
+
+def _pg_exec_db(dbname: str, sql: str) -> dict:
+    return run(['docker', 'exec', SHARED_PG_NAME, 'psql', '-U', SHARED_PG_ADMIN, '-d', dbname, '-c', sql])
+
+def _ensure_bi_proxy() -> bool:
+    """Publica el Postgres compartido en BI_PROXY_PORT para conexiones externas de
+    BI (Power BI/Excel/Tableau). Se usa un contenedor socat en la red nuqleo-net en
+    vez de publicar el puerto del propio Postgres porque este ya corre sin -p y no
+    puede republicarse sin recrearlo; socat resuelve por NOMBRE de contenedor, así
+    que sobrevive a cambios de IP interna tras reinicios. La seguridad real está en
+    los roles de solo lectura por cliente (no en ocultar el puerto)."""
+    r = run(['docker', 'inspect', '--format', '{{.State.Running}}', BI_PROXY_NAME])
+    if r['ok']:
+        if r['stdout'].strip() != 'true':
+            run(['docker', 'start', BI_PROXY_NAME])
+    else:
+        ok = run(f'docker run -d --name {BI_PROXY_NAME} --network nuqleo-net '
+                 f'--restart unless-stopped -p {BI_PROXY_PORT}:{BI_PROXY_PORT} alpine/socat '
+                 f'tcp-listen:{BI_PROXY_PORT},fork,reuseaddr tcp:{SHARED_PG_NAME}:5432', timeout=180)
+        if not ok['ok']:
+            log(f'[bi] proxy socat no arrancó: {(ok["stderr"] or ok["stdout"])[:200]}')
+            return False
+    run(f'ufw allow {BI_PROXY_PORT}/tcp comment "Nuqleo BI read-only Postgres"')
+    return True
 
 def _template_init_ok(name: str) -> bool:
     """Verifica que el init realmente terminó (no solo que el proceso salió sin
@@ -1958,6 +1989,7 @@ class NuqleoHandler(BaseHTTPRequestHandler):
         elif path == '/snapshot-restore': self._handle_snapshot_restore(body)
         elif path == '/snapshot-create':  self._handle_snapshot_create(body)
         elif path == '/restore-upload':   self._handle_restore_upload_chunk(body)
+        elif path == '/bi-access':        self._handle_bi_access(body)
         else:                             self._send(404, {'error': 'Endpoint no encontrado'})
 
     # ── Setup Postgres compartido ─────────────────────────────────
@@ -2142,6 +2174,59 @@ class NuqleoHandler(BaseHTTPRequestHandler):
             result['sql_path'] = sql_file
 
         self._send(200, {'ok': True, **result})
+
+    # ── Acceso BI de solo lectura (Power BI / Excel) a la BD del cliente ──
+    def _handle_bi_access(self, body: dict):
+        name   = _sanitize_name(body.get('container_name', ''))
+        action = str(body.get('action', 'status'))
+        if not name:
+            return self._send(400, {'error': 'container_name requerido'})
+        db_name = _derive_db_name(name)
+        bi_user = f'bi_{db_name}'[:63]  # límite de largo de identificadores en Postgres
+
+        role_exists = _pg_query(f"SELECT 1 FROM pg_roles WHERE rolname='{bi_user}'") == '1'
+
+        if action == 'status':
+            return self._send(200, {'ok': True, 'enabled': role_exists, 'user': bi_user,
+                                    'db': db_name, 'port': BI_PROXY_PORT})
+
+        if action == 'disable':
+            if role_exists:
+                # DROP OWNED revoca todos los grants del rol dentro de la BD;
+                # el default privilege se revoca aparte porque pertenece a 'odoo'.
+                _pg_exec_db(db_name, f'ALTER DEFAULT PRIVILEGES FOR ROLE {SHARED_PG_USER} IN SCHEMA public REVOKE SELECT ON TABLES FROM {bi_user}')
+                _pg_exec_db(db_name, f'DROP OWNED BY {bi_user}')
+                _pg_exec(f'DROP ROLE IF EXISTS {bi_user}')
+            log(f'[bi] {name}: acceso BI desactivado')
+            return self._send(200, {'ok': True, 'enabled': False})
+
+        if action not in ('enable', 'rotate'):
+            return self._send(400, {'error': 'action inválida (status|enable|rotate|disable)'})
+
+        # enable/rotate — idempotente: crea o rota el password y (re)aplica grants.
+        if not _ensure_bi_proxy():
+            return self._send(500, {'ok': False, 'error': 'No se pudo iniciar el proxy de conexión BI'})
+
+        password = os.urandom(18).hex()
+        if role_exists:
+            _pg_exec(f"ALTER ROLE {bi_user} WITH LOGIN PASSWORD '{password}' CONNECTION LIMIT 5")
+        else:
+            _pg_exec(f"CREATE ROLE {bi_user} WITH LOGIN PASSWORD '{password}' CONNECTION LIMIT 5")
+
+        # Aislar la BD: sin esto cualquier rol (incl. los bi_ de OTROS clientes)
+        # puede conectarse por el CONNECT implícito de PUBLIC. El dueño (odoo)
+        # conserva su acceso por ser owner de la BD.
+        _pg_exec(f'REVOKE CONNECT ON DATABASE {db_name} FROM PUBLIC')
+        _pg_exec(f'GRANT CONNECT ON DATABASE {db_name} TO {bi_user}')
+        # Solo lectura sobre TODO el esquema, incluyendo tablas que Odoo cree
+        # después (módulos instalados más tarde) vía default privileges.
+        _pg_exec_db(db_name, f'GRANT USAGE ON SCHEMA public TO {bi_user}')
+        _pg_exec_db(db_name, f'GRANT SELECT ON ALL TABLES IN SCHEMA public TO {bi_user}')
+        _pg_exec_db(db_name, f'ALTER DEFAULT PRIVILEGES FOR ROLE {SHARED_PG_USER} IN SCHEMA public GRANT SELECT ON TABLES TO {bi_user}')
+
+        log(f'[bi] {name}: acceso BI {"rotado" if role_exists else "activado"} ({bi_user})')
+        self._send(200, {'ok': True, 'enabled': True, 'user': bi_user,
+                         'password': password, 'db': db_name, 'port': BI_PROXY_PORT})
 
     # ── Crear snapshot manual bajo demanda ────────────────────────
     def _handle_snapshot_create(self, body: dict):
