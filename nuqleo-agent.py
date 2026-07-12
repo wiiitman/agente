@@ -2463,7 +2463,12 @@ class NuqleoHandler(BaseHTTPRequestHandler):
         #    Se activa --proxy-mode para que Odoo respete los headers X-Forwarded-* del proxy.
         #  - ip (sin proxy): se publica en 0.0.0.0 para acceso directo http://IP:puerto.
         # Workers: 2 HTTP + 1 cron (prefork). shm_size 256m requerido para workers.
-        # mem_limit 1300m: 5 Odoos × 1.3GB = 6.5GB, deja ~1.5GB para sistema+postgres+WP en un VPS 8GB.
+        # RAM elástica: mem_reservation 1300m es lo garantizado por instancia (5 Odoos ×
+        # 1.3GB = 6.5GB, deja ~1.5GB para sistema+postgres+WP en un VPS 8GB). mem_limit
+        # 3000m es el techo de ráfaga — si las otras instancias están libres, esta puede
+        # usar hasta 3GB en vez de quedar limitada a 1.3GB fijos. Si TODAS las instancias
+        # están cargadas a la vez, el kernel prioriza matar procesos por encima de su
+        # reserva, así que ningún cliente se queda sin su 1.3GB garantizado.
         # limit-time-real 1200 evita que tareas largas (importar XLS, informes pesados) maten workers.
         ODOO_PERF_FLAGS = '--workers=2 --limit-time-cpu=600 --limit-time-real=1200 --limit-memory-hard=1073741824 --limit-memory-soft=805306368'
         if ssl_mode == 'selfsigned' and PORT_MIN <= https_port <= PORT_MAX:
@@ -2493,8 +2498,9 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     shm_size: '256m'
-    mem_limit: '1300m'
-    memswap_limit: '1300m'
+    mem_reservation: '1300m'
+    mem_limit: '3000m'
+    memswap_limit: '3000m'
     security_opt:
       - no-new-privileges:true
     networks:
