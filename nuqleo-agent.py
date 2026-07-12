@@ -2554,15 +2554,13 @@ networks:
                 mod_list.append(module)
 
             # Módulos propios que van SIEMPRE preinstalados, sin que el cliente tenga
-            # que elegirlos en "Tus módulos": asistente de bienvenida y el tema estilo
-            # Enterprise (navbar blanco, iconos de apps, login), para que la instancia
-            # se vea y se configure bien desde el primer login.
+            # que elegirlos en "Tus módulos": asistente de bienvenida y el tema de
+            # pantalla de inicio (home_theme — reemplaza a ss_enterprise_theme, que
+            # se retiró por un bug y ya no se ofrece en ninguna lista).
             # Solo si el repo de módulos propios está configurado — si no, quedarían en
             # mod_list sin copiarse a addons y la instalación fallaría al no existir.
-            # ('nuqleo_setup' se quitó de esta lista: esa carpeta no existe en el repo,
-            # así que era código muerto que _have() saltaba en silencio.)
             if MODULES_REPO:
-                mod_list.extend(['company_welcome_wizard', 'ss_enterprise_theme'])
+                mod_list.extend(['company_welcome_wizard', 'home_theme'])
 
             # Cualquier módulo propio (repo custom) que dependa de OTRO módulo propio
             # necesita que ese hermano también esté en mod_list: aunque su carpeta se
@@ -2639,12 +2637,16 @@ networks:
             # módulo propio es descargar su código fuente (ver /store/download-module),
             # no instalarlo dentro de su propia instancia.
             if MODULES_REPO:
+                # Módulos retirados: siguen en el repo pero NO se copian a ningún
+                # deploy nuevo (ss_enterprise_theme se retiró por un bug; su
+                # reemplazo home_theme va preinstalado arriba).
+                _retired = {'ss_enterprise_theme'}
                 repo_src = os.path.join(MODULES_DIR, str(version))
                 if not os.path.isdir(repo_src):
                     _sync_custom_modules()
                 if os.path.isdir(repo_src):
                     for entry in os.listdir(repo_src):
-                        if entry in mod_list or os.path.exists(os.path.join(addons_dir, entry)):
+                        if entry in _retired or entry in mod_list or os.path.exists(os.path.join(addons_dir, entry)):
                             continue
                         if os.path.exists(os.path.join(repo_src, entry, '__manifest__.py')):
                             run(f'cp -r {os.path.join(repo_src, entry)} {addons_dir}/')
