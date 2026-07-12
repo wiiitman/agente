@@ -2611,14 +2611,28 @@ networks:
                 log(f'[deploy] {container}: firma digital (OCA) → {sign_mods}')
 
             # Si el cliente seleccionó Nómina: hr_payroll también es de Enterprise
-            # desde Odoo 17 — 'payroll' de OCA es el equivalente libre.
+            # desde Odoo 17 — 'payroll' de OCA es el equivalente libre. Se prefiere
+            # la copia en el repo propio (nuqleo_odoos) sobre clonar OCA/payroll en
+            # vivo: el clone directo a GitHub sufría por el packet-loss de Contabo
+            # y "no salía para instalar" (fallaba en silencio, ver _fetch_oca_payroll).
             if 'payroll' in mod_list and version in ('16', '17', '18', '19'):
-                _set_stage(container, 'Descargando módulo de nómina (OCA)...')
-                payroll_mods = _fetch_oca_payroll(version, addons_dir)
-                for m in payroll_mods:
-                    if m not in mod_list:
-                        mod_list.append(m)
-                log(f'[deploy] {container}: nómina (OCA) → {payroll_mods}')
+                _set_stage(container, 'Preparando módulo de nómina...')
+                own_src = os.path.join(MODULES_DIR, str(version))
+                has_own_payroll = os.path.isfile(os.path.join(own_src, 'payroll', '__manifest__.py'))
+                if has_own_payroll:
+                    for m in ('payroll', 'payroll_account'):
+                        mod_src = os.path.join(own_src, m)
+                        if os.path.isfile(os.path.join(mod_src, '__manifest__.py')) and not os.path.exists(os.path.join(addons_dir, m)):
+                            run(f'cp -r {mod_src} {addons_dir}/')
+                        if m not in mod_list:
+                            mod_list.append(m)
+                    log(f'[deploy] {container}: nómina copiada desde repo propio (payroll, payroll_account)')
+                else:
+                    payroll_mods = _fetch_oca_payroll(version, addons_dir)
+                    for m in payroll_mods:
+                        if m not in mod_list:
+                            mod_list.append(m)
+                    log(f'[deploy] {container}: nómina (OCA, fallback) → {payroll_mods}')
 
             # Si el cliente seleccionó Soporte: 'helpdesk' también es de Enterprise
             # y no existe en Community — helpdesk_mgmt (OCA) es el equivalente libre.
