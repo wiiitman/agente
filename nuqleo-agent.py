@@ -2566,7 +2566,9 @@ networks:
             # Solo si el repo de módulos propios está configurado — si no, quedarían en
             # mod_list sin copiarse a addons y la instalación fallaría al no existir.
             if MODULES_REPO:
-                mod_list.extend(['company_welcome_wizard', 'home_theme'])
+                # nuqleo_apps_filter: oculta del menú Apps los upsells Enterprise
+                # (to_buy) — el cliente solo ve apps Community + módulos propios.
+                mod_list.extend(['company_welcome_wizard', 'home_theme', 'nuqleo_apps_filter'])
 
             # Cualquier módulo propio (repo custom) que dependa de OTRO módulo propio
             # necesita que ese hermano también esté en mod_list: aunque su carpeta se
