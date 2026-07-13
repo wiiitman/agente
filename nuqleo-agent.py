@@ -432,11 +432,33 @@ COMPOSE = _detect_compose()
 
 # ── Librería de módulos custom (repo git privado, carpetas por versión) ──
 def _sync_custom_modules() -> bool:
-    """Clona/actualiza el repo de módulos custom en MODULES_DIR (swap atómico)."""
+    """Actualiza el repo de módulos custom en MODULES_DIR. Camino rápido: si ya
+    hay un clone válido, hace `git pull` (baja solo el diff). Si no existe
+    todavía o el pull falla, hace clone completo (swap atómico) como antes."""
     if not MODULES_REPO:
         return False
     run('command -v git >/dev/null 2>&1 || (DEBIAN_FRONTEND=noninteractive apt-get install -y git >/dev/null 2>&1)')
     auth_url = f'https://{MODULES_TOKEN}@{MODULES_REPO}' if MODULES_TOKEN else f'https://{MODULES_REPO}'
+
+    # Camino rápido: git pull en vez de rm -rf + clone completo. Antes CADA
+    # sync (wizard abierto, deploy que pide un módulo nuevo, pre-warm al
+    # registrar el servidor) volvía a bajar el repo ENTERO aunque solo hubiera
+    # cambiado un archivo — eso era lo que hacía sentir los deploys lentos
+    # cuando se acababa de publicar un módulo nuevo. git pull trae solo el
+    # diff: mucho más rápido y con mucha menos exposición al packet loss.
+    if os.path.isdir(os.path.join(MODULES_DIR, '.git')):
+        run(f'git -C {MODULES_DIR} remote set-url origin {auth_url}')
+        pull_err = ''
+        for attempt in range(1, 5):
+            r = run(f'timeout 45 git -C {MODULES_DIR} pull --ff-only origin main', timeout=60)
+            if r['ok']:
+                log(f"[modules] pull OK (intento {attempt})")
+                return True
+            pull_err = (r.get('stderr') or '')[:150]
+            if 'not granted' in pull_err or 'Authentication' in pull_err or '403' in pull_err:
+                break
+        log(f"[modules] pull falló, cayendo a clone completo: {pull_err}")
+
     tmp = MODULES_DIR + '.tmp'
     # Contabo pierde ~50-70% de SYN TCP → un clone "largo" casi siempre expira.
     # Estrategia: muchos intentos CORTOS (cap 45s con `timeout`) hasta que un SYN
