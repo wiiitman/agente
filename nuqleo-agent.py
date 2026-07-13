@@ -1155,7 +1155,7 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
 
         # Módulos propios de tema/UX de Nuqleo — livianos y sin datos pesados,
         # se instalan primero para que el cliente vea la marca Nuqleo apenas entra.
-        THEME_MODS = {'nuqleo_apps_filter', 'company_welcome_wizard', 'home_theme'}
+        THEME_MODS = {'nuqleo_apps_filter', 'home_theme'}
         # Paquete fiscal/contable — el más pesado y el que más choca con locks de
         # Postgres (carga el plan de cuentas completo, impuestos, etc. — cientos de
         # registros). Confirmado en vivo 2026-07-13: meter esto en el mismo lote que
@@ -2944,15 +2944,16 @@ networks:
                 mod_list.append(module)
 
             # Módulos propios que van SIEMPRE preinstalados, sin que el cliente tenga
-            # que elegirlos en "Tus módulos": asistente de bienvenida y el tema de
-            # pantalla de inicio (home_theme — reemplaza a ss_enterprise_theme, que
-            # se retiró por un bug y ya no se ofrece en ninguna lista).
+            # que elegirlos en "Tus módulos": el tema de pantalla de inicio (home_theme
+            # — reemplaza a ss_enterprise_theme, que se retiró por un bug y ya no se
+            # ofrece en ninguna lista). company_welcome_wizard se retiró a pedido del
+            # dueño (2026-07-13) — ya no se instala en ningún deploy.
             # Solo si el repo de módulos propios está configurado — si no, quedarían en
             # mod_list sin copiarse a addons y la instalación fallaría al no existir.
             if MODULES_REPO:
                 # nuqleo_apps_filter: oculta del menú Apps los upsells Enterprise
                 # (to_buy) — el cliente solo ve apps Community + módulos propios.
-                mod_list.extend(['company_welcome_wizard', 'home_theme', 'nuqleo_apps_filter'])
+                mod_list.extend(['home_theme', 'nuqleo_apps_filter'])
 
             # Cualquier módulo propio (repo custom) que dependa de OTRO módulo propio
             # necesita que ese hermano también esté en mod_list: aunque su carpeta se
