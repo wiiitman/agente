@@ -1007,6 +1007,23 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
 
         models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
 
+        # Módulos propios de tema/UX de Nuqleo — livianos y sin datos pesados,
+        # se instalan primero para que el cliente vea la marca Nuqleo apenas entra.
+        THEME_MODS = {'nuqleo_apps_filter', 'company_welcome_wizard', 'home_theme'}
+        # Paquete fiscal/contable — el más pesado y el que más choca con locks de
+        # Postgres (carga el plan de cuentas completo, impuestos, etc. — cientos de
+        # registros). Confirmado en vivo 2026-07-13: meter esto en el mismo lote que
+        # todo lo demás hacía que UN solo conflicto de concurrencia tirara el
+        # deploy ENTERO sin entregar nada al cliente en 5-10 minutos. Se instala de
+        # último, en su propia etapa, DESPUÉS de que el cliente ya tiene un Odoo
+        # usable (idioma + tema + su módulo de negocio elegido).
+        HEAVY_FISCAL_MODS = {'account', 'om_account_accountant', 'accounting_pdf_reports',
+                              'om_account_daily_reports', 'om_recurring_payments',
+                              'om_account_asset', 'om_account_budget', 'om_account_followup',
+                              'om_fiscal_year'}
+        def _is_heavy(name: str) -> bool:
+            return name in HEAVY_FISCAL_MODS or name.startswith('l10n_')
+
         # 0. Correo saliente vía Postfix local del VPS (best-effort, no aborta el deploy).
         _configure_local_mail_server(models, uid, db_name, domain)
 
@@ -1058,69 +1075,83 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
             except Exception as ci_err:
                 log(f'[rpc] {container}: no se pudo precargar datos de compañía ({ci_err}) — continúa igual')
 
-        # 1. Instalar módulos seleccionados (solo los que faltan)
+        # Refrescar la lista de módulos ANTES de buscar cuáles instalar. Los
+        # módulos custom (ss_enterprise_theme, om_account_*, etc.) se copian
+        # a addons justo antes de levantar el container — si Odoo todavía no
+        # terminó de escanear el addons_path cuando corre el search de abajo,
+        # ese módulo ni siquiera tiene fila en ir.module.module todavía, así
+        # que el filtro "name in mods_list" no lo encuentra y se queda sin
+        # instalar en silencio (se ve en ir.module.module más tarde como
+        # 'uninstalled' — Odoo lo descubrió después, pero ya nadie le pidió
+        # instalarlo). update_list() fuerza el escaneo del disco ahora mismo.
         if mods_list:
-            # Refrescar la lista de módulos ANTES de buscar cuáles instalar. Los
-            # módulos custom (ss_enterprise_theme, om_account_*, etc.) se copian
-            # a addons justo antes de levantar el container — si Odoo todavía no
-            # terminó de escanear el addons_path cuando corre el search de abajo,
-            # ese módulo ni siquiera tiene fila en ir.module.module todavía, así
-            # que el filtro "name in mods_list" no lo encuentra y se queda sin
-            # instalar en silencio (se ve en ir.module.module más tarde como
-            # 'uninstalled' — Odoo lo descubrió después, pero ya nadie le pidió
-            # instalarlo). update_list() fuerza el escaneo del disco ahora mismo.
             try:
                 models.execute_kw(db_name, uid, 'admin', 'ir.module.module', 'update_list', [])
             except Exception as ul_err:
                 log(f'[rpc] {container}: update_list falló ({ul_err}), continúa igual')
 
+        def _install_group(group_mods: list, label: str):
+            """Instala un subconjunto de mods_list y espera a que Odoo vuelva tras
+            el reinicio de workers que hace button_immediate_install. Se usa por
+            etapas (ver más abajo) en vez de un solo lote gigante: así el cliente
+            recibe un Odoo usable (idioma + tema + su módulo elegido) en pocos
+            minutos, y el paquete fiscal pesado —el más lento y el más propenso a
+            choques de concurrencia— instala de último sin bloquear la entrega."""
+            nonlocal uid
+            if not group_mods:
+                return
             pending = models.execute_kw(
                 db_name, uid, 'admin',
                 'ir.module.module', 'search',
-                [[['name', 'in', mods_list], ['state', 'not in', ['installed', 'to install', 'to upgrade']]]]
+                [[['name', 'in', group_mods], ['state', 'not in', ['installed', 'to install', 'to upgrade']]]]
             )
-            if pending:
-                log(f'[rpc] {container}: instalando {len(pending)} módulos via XML-RPC')
+            if not pending:
+                return
+            log(f'[rpc] {container}: instalando etapa "{label}" ({len(pending)} módulos) via XML-RPC')
+            _set_stage(container, f'Instalando {label}...')
+            try:
+                # tries/base_delay más altos que el default: este es el request
+                # más largo y propenso a chocar con el tráfico del cliente (ver
+                # _retry_on_serialization_failure) — cada reintento arranca la
+                # instalación desde donde quedó (los módulos ya commiteados
+                # quedan 'installed'), así que insistir es barato y recupera.
+                _retry_on_serialization_failure(lambda: models.execute_kw(
+                    db_name, uid, 'admin',
+                    'ir.module.module', 'button_immediate_install',
+                    [pending]
+                ), tries=6, base_delay=10.0)
+            except Exception as install_err:
+                # button_immediate_install reinicia los workers de Odoo COMO PARTE
+                # de su funcionamiento normal — el worker que atendía este request
+                # muere antes de devolver respuesta, y el cliente XML-RPC ve
+                # "Connection refused/reset" aunque la instalación sí haya
+                # arrancado bien. Tratar esto como error fatal (antes lo hacía)
+                # mandaba el deploy entero al fallback one-off innecesariamente.
+                msg = str(install_err).lower()
+                if 'connection refused' not in msg and 'connection reset' not in msg and 'broken pipe' not in msg:
+                    raise
+                log(f'[rpc] {container}: conexión cortada durante "{label}" '
+                    f'(normal, Odoo reinicia workers) — se continúa esperando que vuelva')
+            # button_immediate_install reinicia los workers de Odoo internamente.
+            # Hay que esperar a que Odoo vuelva antes de continuar con la siguiente etapa.
+            log(f'[rpc] {container}: esperando que Odoo vuelva tras "{label}"...')
+            time.sleep(8)
+            for _ in range(30):
                 try:
-                    # tries/base_delay más altos que el default: este es el request
-                    # más largo y propenso a chocar con el tráfico del cliente (ver
-                    # _retry_on_serialization_failure) — cada reintento arranca la
-                    # instalación desde donde quedó (los módulos ya commiteados
-                    # quedan 'installed'), así que insistir es barato y recupera.
-                    _retry_on_serialization_failure(lambda: models.execute_kw(
-                        db_name, uid, 'admin',
-                        'ir.module.module', 'button_immediate_install',
-                        [pending]
-                    ), tries=6, base_delay=10.0)
-                except Exception as install_err:
-                    # button_immediate_install reinicia los workers de Odoo COMO PARTE
-                    # de su funcionamiento normal — el worker que atendía este request
-                    # muere antes de devolver respuesta, y el cliente XML-RPC ve
-                    # "Connection refused/reset" aunque la instalación sí haya
-                    # arrancado bien. Tratar esto como error fatal (antes lo hacía)
-                    # mandaba el deploy entero al fallback one-off innecesariamente.
-                    msg = str(install_err).lower()
-                    if 'connection refused' not in msg and 'connection reset' not in msg and 'broken pipe' not in msg:
-                        raise
-                    log(f'[rpc] {container}: conexión cortada durante la instalación '
-                        f'(normal, Odoo reinicia workers) — se continúa esperando que vuelva')
-                # button_immediate_install reinicia los workers de Odoo internamente.
-                # Hay que esperar a que Odoo vuelva antes de continuar.
-                log(f'[rpc] {container}: esperando que Odoo vuelva tras reinicio de workers...')
-                time.sleep(8)
-                for _ in range(30):
-                    try:
-                        uid = common.authenticate(db_name, 'admin', 'admin', {})
-                        if uid:
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(3)
+                    new_uid = common.authenticate(db_name, 'admin', 'admin', {})
+                    if new_uid:
+                        uid = new_uid
+                        break
+                except Exception:
+                    pass
+                time.sleep(3)
 
-        # 2. Activar idioma (si no es en_US que viene por defecto).
-        #    Se hace DESPUÉS del reinicio post-módulos para que la conexión sea estable.
+        # 1. Idioma PRIMERO — no depende de ningún módulo custom, es rápido, y le
+        #    da al cliente una interfaz en español desde el primer minuto en vez
+        #    de esperar a que termine todo lo demás para verla traducida.
         if lang and lang != 'en_US':
             try:
+                _set_stage(container, f'Activando idioma {lang}...')
                 # load_lang activa el idioma e importa las traducciones
                 try:
                     _retry_on_serialization_failure(lambda: models.execute_kw(
@@ -1162,6 +1193,21 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
                 log(f'[rpc] {container}: idioma {lang} activado OK')
             except Exception as le:
                 log(f'[rpc] {container}: idioma {lang} FALLÓ: {le}')
+
+        # 2. Tema/UX propio de Nuqleo — liviano, da la marca Nuqleo de una vez.
+        theme_mods = [m for m in mods_list if m in THEME_MODS]
+        _install_group(theme_mods, 'tema y accesos de Nuqleo')
+
+        # 3. Módulo(s) de negocio que el cliente eligió en el wizard (sale, project,
+        #    lo que sea) — el Odoo "tradicional" que el cliente espera ver rápido.
+        base_mods = [m for m in mods_list if m not in THEME_MODS and not _is_heavy(m)]
+        _install_group(base_mods, 'tus módulos de negocio')
+
+        # 4. Paquete fiscal/contable — de ÚLTIMO porque es el más lento y el más
+        #    propenso a chocar con locks (ver comentario en HEAVY_FISCAL_MODS
+        #    arriba). Para esta altura el cliente YA tiene un Odoo usable.
+        heavy_mods = [m for m in mods_list if _is_heavy(m)]
+        _install_group(heavy_mods, 'paquete contable/fiscal (puede tardar más)')
 
         # Reinicio final tras instalar módulos + idioma: Odoo sirve los bundles de
         # JS/QWeb (web.assets_backend) tal como estaban compilados en el momento de
