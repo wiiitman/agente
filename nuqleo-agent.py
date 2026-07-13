@@ -13,6 +13,7 @@ Mejoras de seguridad vs v1:
 
 import json, os, re, subprocess, tempfile, zipfile, base64
 import hashlib, hmac, time, threading
+import xmlrpc.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import defaultdict
 from urllib.parse import urlparse, parse_qs
@@ -954,11 +955,36 @@ def _retry_on_serialization_failure(fn, tries: int = 4, base_delay: float = 6.0)
     raise last_err
 
 
+class _TimeoutTransport(xmlrpc.client.Transport):
+    """Transport de xmlrpc.client con timeout de socket explícito. Sin esto, un
+    ServerProxy normal NUNCA expira: confirmado en vivo 2026-07-13 con pg_stat_activity
+    mostrando TODAS las conexiones de Postgres en estado idle (nada bloqueado en la
+    BD) mientras la llamada button_immediate_install seguía "colgada" varios minutos
+    del lado del agente. button_immediate_install reinicia los workers de Odoo matando
+    el proceso que atendía el request — si esa muerte no cierra el socket TCP con un
+    FIN/RST limpio (pasa bajo carga), el socket.recv() del cliente se queda esperando
+    para siempre y nuestro _retry_on_serialization_failure nunca ve la excepción que
+    necesita para reintentar. Con este timeout, un socket colgado revienta con
+    TimeoutError en vez de bloquear el deploy indefinidamente."""
+    def __init__(self, timeout, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._nuqleo_timeout = timeout
+
+    def make_connection(self, host):
+        conn = super().make_connection(host)
+        conn.timeout = self._nuqleo_timeout
+        return conn
+
+
 def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: int, version: str, lang: str = 'es_CO', domain: str = '', fiscal: str = '', company_info: dict = None) -> bool:
     """Instala módulos e idioma via XML-RPC mientras Odoo está corriendo.
     Espera hasta que Odoo responda, instala módulos, activa idioma y Odoo se reinicia solo."""
     import xmlrpc.client
     url = f'http://127.0.0.1:{port}'
+    # 240s: generoso para que un button_immediate_install del paquete fiscal pesado
+    # (el más lento observado) no se corte en medio de una instalación legítima,
+    # pero acota el peor caso de un socket colgado tras el reinicio de workers.
+    _RPC_TIMEOUT = 240
 
     # Esperar que Odoo esté listo — espera inicial de 20s (Odoo nunca responde antes),
     # luego polling cada 3s hasta 5 min. Sin el restart previo Odoo suele estar listo
@@ -1000,12 +1026,13 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
 
     _set_stage(container, f'Instalando módulos e idioma {lang}...')
     try:
-        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
+        _rpc_transport = _TimeoutTransport(_RPC_TIMEOUT)
+        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True, transport=_rpc_transport)
         uid = common.authenticate(db_name, 'admin', 'admin', {})
         if not uid:
             raise RuntimeError('auth falló con admin/admin')
 
-        models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
+        models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True, transport=_rpc_transport)
 
         # Módulos propios de tema/UX de Nuqleo — livianos y sin datos pesados,
         # se instalan primero para que el cliente vea la marca Nuqleo apenas entra.
@@ -1127,10 +1154,17 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
                 # "Connection refused/reset" aunque la instalación sí haya
                 # arrancado bien. Tratar esto como error fatal (antes lo hacía)
                 # mandaba el deploy entero al fallback one-off innecesariamente.
+                # 'timed out' incluido: confirmado en vivo 2026-07-13 que sin timeout
+                # en el transport XML-RPC (ver _TimeoutTransport) esta llamada podía
+                # quedarse colgada varios minutos con Postgres 100% idle (nada
+                # bloqueado en la BD) — el socket del cliente nunca recibía el cierre
+                # de conexión tras el reinicio de workers de Odoo.
                 msg = str(install_err).lower()
-                if 'connection refused' not in msg and 'connection reset' not in msg and 'broken pipe' not in msg:
+                CONN_DROP_TAGS = ('connection refused', 'connection reset', 'broken pipe',
+                                  'timed out', 'timeout')
+                if not any(tag in msg for tag in CONN_DROP_TAGS):
                     raise
-                log(f'[rpc] {container}: conexión cortada durante "{label}" '
+                log(f'[rpc] {container}: conexión cortada/expirada durante "{label}" '
                     f'(normal, Odoo reinicia workers) — se continúa esperando que vuelva')
             # button_immediate_install reinicia los workers de Odoo internamente.
             # Hay que esperar a que Odoo vuelva antes de continuar con la siguiente etapa.
@@ -1262,7 +1296,8 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
         # el paquete de idioma listo pero el login se seguía viendo en inglés.
         if ok and lang and lang != 'en_US':
             try:
-                fb_common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
+                fb_common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True,
+                                                       transport=_TimeoutTransport(_RPC_TIMEOUT))
                 fb_uid = None
                 # 40 iteraciones (~2min): el one-off de arriba ahora para/arranca el
                 # contenedor principal, así que aquí Odoo SIEMPRE está re-arrancando.
@@ -1275,7 +1310,8 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
                         pass
                     time.sleep(3)
                 if fb_uid:
-                    fb_models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
+                    fb_models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True,
+                                                           transport=_TimeoutTransport(_RPC_TIMEOUT))
                     admin_ids = fb_models.execute_kw(db_name, fb_uid, 'admin', 'res.users', 'search',
                                                       [[['login', '=', 'admin']]])
                     if admin_ids:
