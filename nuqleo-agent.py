@@ -976,6 +976,103 @@ class _TimeoutTransport(xmlrpc.client.Transport):
         return conn
 
 
+def _swap_to_nocron(container: str, port: int) -> str:
+    """Detiene el contenedor principal y levanta uno gemelo temporal con
+    --max-cron-threads=0, mismo puerto/red/volúmenes, para correr la
+    instalación de módulos SIN el cron de Odoo corriendo en paralelo.
+
+    Por qué: confirmado en vivo 2026-07-13 que el cron interno de Odoo
+    (WorkerCron, siempre activo con --workers=2) ejecuta
+    _check_modules_state() en cada ciclo — un UPDATE sobre ir_module_module
+    que choca ("could not serialize access due to concurrent update") con
+    CUALQUIER button_immediate_install que mantenga una transacción abierta
+    más de unos segundos. Pasaba incluso instalando un solo módulo ('sale'),
+    quemando 6 reintentos (~8 min) y a veces fallando igual. Sin cron
+    corriendo, no hay con qué chocar.
+
+    El cliente mantiene cron normal en su Odoo final — este contenedor
+    temporal solo vive durante la instalación (ver _swap_back).
+    Devuelve el nombre del contenedor temporal si el swap funcionó, o ''
+    si algo falló (en cuyo caso el caller debe seguir usando `container`
+    directo, aceptando el riesgo de choque en vez de bloquear el deploy)."""
+    deploy_dir = os.path.join(ODOO_DIR, container)
+    addons_dir = os.path.join(deploy_dir, 'addons')
+    compose_path = os.path.join(deploy_dir, 'docker-compose.yml')
+    try:
+        with open(compose_path) as f:
+            compose_txt = f.read()
+        m = re.search(r'^\s*command:\s*(.+)$', compose_txt, re.MULTILINE)
+        if not m:
+            log(f'[nocron] {container}: no se encontró "command:" en docker-compose.yml')
+            return ''
+        # docker-compose escapa '$' como '$$' dentro del YAML (para --db-filter=^x$).
+        # Al ejecutar esto nosotros mismos vía subprocess SIN shell (ver más abajo),
+        # nadie hace esa des-escapada — hay que deshacerla a mano o Odoo recibe
+        # literalmente dos signos de pesos en el regex del filtro de base de datos.
+        base_args = m.group(1).strip().replace('$$', '$').split()
+        # El puerto puede estar publicado en 127.0.0.1 (modo selfsigned, detrás de
+        # nginx) o en 0.0.0.0 (modo IP directa, sin dominio) — replicar EXACTO el
+        # binding original o el acceso directo por IP se rompería durante el swap.
+        pm = re.search(r'ports:\s*\n\s*-\s*"([^"]+)"', compose_txt)
+        port_bind = pm.group(1) if pm else f'{port}:8069'
+    except Exception as e:
+        log(f'[nocron] {container}: no se pudo leer docker-compose.yml ({e})')
+        return ''
+
+    # La versión de Odoo no viaja como parámetro de esta función — se lee de la
+    # imagen que ya usa el contenedor original en vez de pedir un argumento más.
+    img_r = run(['docker', 'inspect', container, '--format', '{{.Config.Image}}'])
+    image = img_r['stdout'].strip() if img_r['ok'] and img_r['stdout'].strip() else 'odoo:18'
+
+    temp_name = f'{container}_nocron'
+    run(['docker', 'rm', '-f', temp_name])  # por si quedó uno huérfano de una corrida anterior
+    stop_r = run(['docker', 'stop', container], timeout=90)
+    if not stop_r['ok']:
+        log(f'[nocron] {container}: no se pudo detener el contenedor principal, se aborta el swap')
+        return ''
+
+    # Lista, no string+shell=True: evita que bash interprete el '$' del
+    # --db-filter (p.ej. como '$$' = PID del shell) o cualquier otro metacarácter.
+    docker_args = [
+        'docker', 'run', '-d', '--name', temp_name, '--network', 'nuqleo-net',
+        '-p', port_bind,
+        '-e', f'HOST={SHARED_PG_NAME}', '-e', f'USER={SHARED_PG_USER}', '-e', f'PASSWORD={SHARED_PG_PASS}',
+        '-v', f'{deploy_dir}/odoo-data:/var/lib/odoo',
+        '-v', f'{addons_dir}:/mnt/extra-addons',
+        '--add-host', 'host.docker.internal:host-gateway',
+        '--shm-size=256m',
+        image,
+    ] + base_args + ['--max-cron-threads=0']
+    start_r = run(docker_args)
+    if not start_r['ok']:
+        log(f'[nocron] {container}: no se pudo iniciar el contenedor temporal sin cron ({start_r.get("stderr","")[:150]}), restaurando el original')
+        run(['docker', 'rm', '-f', temp_name])
+        run(['docker', 'start', container])
+        return ''
+
+    # Esperar a que el contenedor temporal responda antes de devolver el control.
+    for _ in range(30):
+        r = run(f'curl -sf --max-time 3 -o /dev/null -w "%{{http_code}}" http://127.0.0.1:{port}/web/login 2>/dev/null', timeout=6)
+        if r['ok'] and r['stdout'].strip() in ('200', '303'):
+            log(f'[nocron] {container}: swap a instancia sin cron OK ({temp_name})')
+            return temp_name
+        time.sleep(2)
+    log(f'[nocron] {container}: la instancia sin cron no respondió a tiempo, restaurando el original')
+    run(['docker', 'rm', '-f', temp_name])
+    run(['docker', 'start', container])
+    return ''
+
+
+def _swap_back(temp_name: str, container: str):
+    """Apaga la instancia temporal sin cron y devuelve el contenedor real
+    (con cron normal) a su estado corriendo — contraparte de _swap_to_nocron."""
+    if not temp_name:
+        return
+    run(['docker', 'rm', '-f', temp_name])
+    run(['docker', 'start', container])
+    log(f'[nocron] {container}: instancia sin cron apagada, contenedor original restaurado')
+
+
 def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: int, version: str, lang: str = 'es_CO', domain: str = '', fiscal: str = '', company_info: dict = None) -> bool:
     """Instala módulos e idioma via XML-RPC mientras Odoo está corriendo.
     Espera hasta que Odoo responda, instala módulos, activa idioma y Odoo se reinicia solo."""
@@ -1025,6 +1122,11 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
         return False
 
     _set_stage(container, f'Instalando módulos e idioma {lang}...')
+    # Swap a una instancia gemela sin cron para TODA la instalación — ver
+    # _swap_to_nocron. Si el swap falla por cualquier motivo, seguimos contra el
+    # contenedor original (temp_name queda '') aceptando el riesgo de choque en
+    # vez de bloquear el deploy entero por esto.
+    temp_name = _swap_to_nocron(container, port)
     try:
         _rpc_transport = _TimeoutTransport(_RPC_TIMEOUT)
         common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True, transport=_rpc_transport)
@@ -1251,8 +1353,18 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
         # "KeyNotFoundError: Cannot find key 'mail.action_discuss' in the actions
         # registry" en el primer login. Un restart limpio al final fuerza a Odoo a
         # sched los assets ya con el registro de módulos completo y estable.
-        log(f'[rpc] {container}: reinicio final para asegurar assets JS/QWeb limpios...')
-        run(['docker', 'restart', container])
+        # Reinicio final: si hicimos swap sin cron, devolver el contenedor real
+        # (con cron normal para el cliente) YA es un arranque limpio con el
+        # registro de módulos completo — hace lo mismo que el restart de assets
+        # de abajo, así que no hace falta repetirlo. Si no hubo swap (falló por
+        # algún motivo), seguimos con el restart explícito de siempre.
+        if temp_name:
+            log(f'[rpc] {container}: instalación terminada, devolviendo el contenedor real (con cron)...')
+            _swap_back(temp_name, container)
+            temp_name = ''  # ya restaurado — que el finally no lo repita
+        else:
+            log(f'[rpc] {container}: reinicio final para asegurar assets JS/QWeb limpios...')
+            run(['docker', 'restart', container])
         for _ in range(40):
             time.sleep(3)
             r3 = run(f'curl -sf --max-time 3 -o /dev/null -w "%{{http_code}}" {url}/web/login 2>/dev/null', timeout=6)
@@ -1276,7 +1388,13 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
         # locks y también falla (confirmado en vivo 2026-07-13: one-off ok=False
         # en 28s). Detenido el principal, el one-off tiene la BD para él solo.
         _set_stage(container, 'Finalizando instalación de módulos...')
-        run(['docker', 'stop', container], timeout=90)
+        if temp_name:
+            # El contenedor real ya está detenido (quedó así desde el swap) — solo
+            # hay que tumbar la instancia temporal antes del one-off.
+            run(['docker', 'rm', '-f', temp_name])
+            temp_name = ''
+        else:
+            run(['docker', 'stop', container], timeout=90)
         inst = run(
             f'docker run --rm --network nuqleo-net '
             f'-v {addons_dir}:/mnt/extra-addons '
@@ -1331,6 +1449,13 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
                 log(f'[rpc-fallback] {container}: no se pudo asignar idioma a admin/compañía: {le}')
 
         return ok
+
+    finally:
+        # Red de seguridad: si algo inesperado no contemplado arriba dejó la
+        # instancia temporal sin cron todavía viva a esta altura, nunca dejar el
+        # contenedor real del cliente detenido para siempre.
+        if temp_name:
+            _swap_back(temp_name, container)
 
 
 # ── Subida de módulo a un deployment YA existente: snapshot + instalar + revertir
