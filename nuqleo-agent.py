@@ -919,14 +919,27 @@ def _retry_on_serialization_failure(fn, tries: int = 4, base_delay: float = 6.0)
       de Odoo (cron) toma el lock de ir_cron casi al mismo tiempo que el install,
       y Odoo lo detecta y lanza "Odoo is currently processing a scheduled action"
       en vez de esperar — hay que reintentar nosotros desde afuera.
-    Ambos son transitorios y esperados bajo carga (Odoo corre con --workers=2,
+    - 'LockNotAvailable: canceling statement due to lock timeout' — Odoo 18 pone
+      lock_timeout en sus DDL: si el cliente ya está navegando el login mientras
+      corre la instalación (el wizard entrega los accesos a los ~60s pero el
+      install tarda 2-4 min), la compilación de asset bundles (requests de 10s+)
+      mantiene locks de lectura sobre res_company y el ALTER TABLE del install
+      muere en vez de esperar. Confirmado en vivo 2026-07-13.
+    - "doesn't have 'read' access to ... (ir.module.module)" — síntoma tardío del
+      mismo incidente: tras abortar el graph load por el lock timeout, el reintento
+      interno de Odoo corre contra un registry a medio cargar y devuelve AccessError
+      aunque el uid sea admin. Con el registry recargado, reintentar desde afuera
+      sí funciona.
+    Todos son transitorios y esperados bajo carga (Odoo corre con --workers=2,
     hay crons y requests de otros workers tocando las mismas tablas). Confirmado
     en vivo: Odoo YA reintenta internamente unas pocas veces y aun así puede
     agotarlas; sin este reintento externo el módulo/idioma quedaba sin instalar
     en silencio y el fallback (contenedor one-off contra la misma BD que el
     contenedor principal, ya corriendo) tampoco es confiable."""
     RETRYABLE = ('serializ', 'concurrent update', 'ir_cron', 'scheduled action',
-                 'locknotavailable', 'could not obtain lock', 'infailedsqltransaction')
+                 'locknotavailable', 'could not obtain lock', 'infailedsqltransaction',
+                 'lock timeout', 'canceling statement', "have 'read' access",
+                 'failed to load registry')
     last_err = None
     for attempt in range(1, tries + 1):
         try:
@@ -1069,11 +1082,16 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
             if pending:
                 log(f'[rpc] {container}: instalando {len(pending)} módulos via XML-RPC')
                 try:
+                    # tries/base_delay más altos que el default: este es el request
+                    # más largo y propenso a chocar con el tráfico del cliente (ver
+                    # _retry_on_serialization_failure) — cada reintento arranca la
+                    # instalación desde donde quedó (los módulos ya commiteados
+                    # quedan 'installed'), así que insistir es barato y recupera.
                     _retry_on_serialization_failure(lambda: models.execute_kw(
                         db_name, uid, 'admin',
                         'ir.module.module', 'button_immediate_install',
                         [pending]
-                    ))
+                    ), tries=6, base_delay=10.0)
                 except Exception as install_err:
                     # button_immediate_install reinicia los workers de Odoo COMO PARTE
                     # de su funcionamiento normal — el worker que atendía este request
@@ -1171,6 +1189,14 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
         addons_dir = os.path.join(ODOO_DIR, container, 'addons')
         mods_csv = ','.join(mods_list)
         lang_flag = f'--load-language {lang}' if lang else ''
+        # Parar el contenedor principal mientras corre el one-off: la causa #1 de
+        # llegar a este fallback es tráfico web del cliente (login/compilación de
+        # assets) tomando locks sobre las mismas tablas que el install necesita
+        # ALTERar — con el principal corriendo, el one-off choca con los MISMOS
+        # locks y también falla (confirmado en vivo 2026-07-13: one-off ok=False
+        # en 28s). Detenido el principal, el one-off tiene la BD para él solo.
+        _set_stage(container, 'Finalizando instalación de módulos...')
+        run(['docker', 'stop', container], timeout=90)
         inst = run(
             f'docker run --rm --network nuqleo-net '
             f'-v {addons_dir}:/mnt/extra-addons '
@@ -1179,6 +1205,7 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
             f'{"--init " + mods_csv if mods_csv else ""} {lang_flag} --stop-after-init --no-http',
             timeout=900
         )
+        run(['docker', 'start', container], timeout=90)
         ok = inst['ok'] or 'stop' in (inst['stdout'] + inst['stderr']).lower()
         _set_stage(container, 'Listo ✓' if ok else f'Aviso: módulos no instalados ({mods_csv})')
         log(f'[rpc-fallback] {container}: one-off ok={ok}')
@@ -1191,7 +1218,9 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
             try:
                 fb_common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
                 fb_uid = None
-                for _ in range(20):
+                # 40 iteraciones (~2min): el one-off de arriba ahora para/arranca el
+                # contenedor principal, así que aquí Odoo SIEMPRE está re-arrancando.
+                for _ in range(40):
                     try:
                         fb_uid = fb_common.authenticate(db_name, 'admin', 'admin', {})
                         if fb_uid:
