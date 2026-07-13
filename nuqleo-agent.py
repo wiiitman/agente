@@ -2063,6 +2063,19 @@ class NuqleoHandler(BaseHTTPRequestHandler):
                     log(f'[setup] pre-warm módulos propios falló: {e}')
 
             _ensure_host_postfix()
+
+            # Re-aplica el proxy BI y su regla de UFW en cada setup/registro del
+            # servidor. Sin esto, una reinstalación del agente (que hace
+            # `ufw --force reset` + reaplica solo la lista estática de puertos)
+            # borraba silenciosamente la regla de BI_PROXY_PORT mientras el
+            # contenedor socat seguía corriendo de una corrida anterior —
+            # el puerto quedaba "vivo" pero inalcanzable, y nada lo detectaba
+            # hasta que un cliente reportara que Power BI no conectaba.
+            try:
+                _ensure_bi_proxy()
+            except Exception as e:
+                log(f'[setup] pre-warm proxy BI falló: {e}')
+
             log('[setup] Setup postgres completado.')
         threading.Thread(target=_do_setup, daemon=True).start()
 
