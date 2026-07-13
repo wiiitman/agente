@@ -978,8 +978,10 @@ class _TimeoutTransport(xmlrpc.client.Transport):
 
 def _swap_to_nocron(container: str, port: int) -> str:
     """Detiene el contenedor principal y levanta uno gemelo temporal con
-    --max-cron-threads=0, mismo puerto/red/volúmenes, para correr la
-    instalación de módulos SIN el cron de Odoo corriendo en paralelo.
+    --workers=0 --max-cron-threads=0, mismo puerto/red/volúmenes, para
+    correr la instalación de módulos en un ÚNICO proceso Odoo (un solo
+    registry en memoria, sin cron), sin nada más que pueda tocar
+    ir_module_module en paralelo.
 
     Por qué: confirmado en vivo 2026-07-13 que el cron interno de Odoo
     (WorkerCron, siempre activo con --workers=2) ejecuta
@@ -987,8 +989,12 @@ def _swap_to_nocron(container: str, port: int) -> str:
     que choca ("could not serialize access due to concurrent update") con
     CUALQUIER button_immediate_install que mantenga una transacción abierta
     más de unos segundos. Pasaba incluso instalando un solo módulo ('sale'),
-    quemando 6 reintentos (~8 min) y a veces fallando igual. Sin cron
-    corriendo, no hay con qué chocar.
+    quemando 6 reintentos (~8 min) y a veces fallando igual.
+    Luego se confirmó (mismo día, deploy en vivo) que apagar SOLO el cron no
+    bastaba: con --workers=2 cada proceso HTTP recarga su propio registry al
+    detectar un cambio en ir_module_module, y esa recarga puede reprocesar un
+    módulo en estado 'to install' — chocando igual aunque el cron esté
+    apagado. Por eso el contenedor temporal también fuerza --workers=0.
 
     El cliente mantiene cron normal en su Odoo final — este contenedor
     temporal solo vive durante la instalación (ver _swap_back).
@@ -1010,6 +1016,17 @@ def _swap_to_nocron(container: str, port: int) -> str:
         # nadie hace esa des-escapada — hay que deshacerla a mano o Odoo recibe
         # literalmente dos signos de pesos en el regex del filtro de base de datos.
         base_args = m.group(1).strip().replace('$$', '$').split()
+        # --workers=N del compose original (típicamente 2) se descarta: con
+        # multi-worker, cada proceso HTTP recarga su PROPIO registry cuando
+        # detecta un cambio en ir_module_module, y esa recarga puede volver a
+        # procesar un módulo en estado 'to install'/'to upgrade' — chocando
+        # con la transacción del install en curso aunque el cron esté
+        # apagado. Confirmado en vivo 2026-07-13: seguían los mismos
+        # "SerializationFailure" con --max-cron-threads=0 pero --workers=2.
+        # --workers=0 corre todo en un solo proceso (modo threaded), con un
+        # único registry en memoria — ya no hay un segundo proceso que pueda
+        # recargarlo en paralelo.
+        base_args = [a for a in base_args if not re.match(r'--workers(=|$)', a)]
         # El puerto puede estar publicado en 127.0.0.1 (modo selfsigned, detrás de
         # nginx) o en 0.0.0.0 (modo IP directa, sin dominio) — replicar EXACTO el
         # binding original o el acceso directo por IP se rompería durante el swap.
@@ -1042,7 +1059,7 @@ def _swap_to_nocron(container: str, port: int) -> str:
         '--add-host', 'host.docker.internal:host-gateway',
         '--shm-size=256m',
         image,
-    ] + base_args + ['--max-cron-threads=0']
+    ] + base_args + ['--workers=0', '--max-cron-threads=0']
     start_r = run(docker_args)
     if not start_r['ok']:
         log(f'[nocron] {container}: no se pudo iniciar el contenedor temporal sin cron ({start_r.get("stderr","")[:150]}), restaurando el original')
