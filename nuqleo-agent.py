@@ -11,7 +11,7 @@ Mejoras de seguridad vs v1:
   - Versión de Odoo validada contra whitelist
 """
 
-import json, os, re, subprocess, tempfile, zipfile, base64
+import json, os, re, subprocess, tempfile, zipfile, base64, shutil
 import hashlib, hmac, time, threading
 import xmlrpc.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -313,6 +313,16 @@ def _create_db_from_template(db_name: str, version: str) -> bool:
     return r['ok']
 
 
+def _drop_db(db_name: str) -> bool:
+    """Borra la BD de un cliente para un redespliegue (reset completo). Primero
+    corta cualquier conexión colgada (Odoo ya debería estar detenido, pero un
+    worker zombie con una transacción abierta bloquearía el DROP DATABASE)."""
+    _pg_exec(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+             f"WHERE datname='{db_name}' AND pid <> pg_backend_pid()")
+    r = _pg_exec(f"DROP DATABASE IF EXISTS {db_name}")
+    return r['ok']
+
+
 # ── Helpers ──────────────────────────────────────────────────────
 def run(cmd: list | str, timeout=120) -> dict:
     """Ejecuta comando. Prefiere lista para evitar shell injection."""
@@ -517,6 +527,99 @@ def _resolve_custom_module_deps(mod_list: list, version: str) -> list:
                 result.append(dep)
                 queue.append(dep)
     return result
+
+
+def _prepare_addons_modules(container: str, addons_dir: str, mod_list: list, version: str) -> list:
+    """Copia los módulos propios elegidos a addons_dir y resuelve los que son
+    Enterprise-only en Community (contabilidad completa, firma digital, nómina,
+    mesa de ayuda) a sus equivalentes OCA/propios. Devuelve el mod_list final
+    (con todos los añadidos ya resueltos).
+
+    Extraído tal cual del bloque equivalente de _handle_deploy._do_deploy para
+    reutilizarlo en _handle_redeploy sin tocar el flujo de deploy original —
+    ese flujo se acaba de estabilizar (2026-07-13) tras varias rondas de fixes
+    de concurrencia, así que a propósito NO se refactoriza _do_deploy para
+    llamar a esta función; queda una duplicación pequeña a cambio de cero
+    riesgo sobre el deploy que ya funciona."""
+    if MODULES_REPO:
+        # nuqleo_apps_filter: oculta del menú Apps los upsells Enterprise
+        # (to_buy) — el cliente solo ve apps Community + módulos propios.
+        mod_list = list(mod_list) + ['home_theme', 'nuqleo_apps_filter']
+        mod_list = _resolve_custom_module_deps(mod_list, version)
+    mod_list = list(dict.fromkeys(mod_list))  # dedupe, conserva orden
+
+    if MODULES_REPO and mod_list:
+        src = os.path.join(MODULES_DIR, str(version))
+        _have = lambda m: os.path.exists(os.path.join(src, m, '__manifest__.py'))
+        if any(not _have(m) for m in mod_list):
+            _sync_custom_modules()
+        for m in mod_list:
+            if _have(m):
+                run(f'cp -r {os.path.join(src, m)} {addons_dir}/')
+                log(f'[deploy] {container}: módulo custom {m} copiado a addons')
+
+    if 'account' in mod_list and version in ('17', '18', '19'):
+        _set_stage(container, 'Descargando suite de contabilidad completa...')
+        om_mods = _fetch_om_accounting(version, addons_dir)
+        for m in om_mods:
+            if m not in mod_list:
+                mod_list.append(m)
+        log(f'[deploy] {container}: suite contabilidad → {om_mods}')
+
+    if 'sign' in mod_list and version in ('17', '18', '19'):
+        _set_stage(container, 'Descargando módulo de firma digital (OCA)...')
+        mod_list = [m for m in mod_list if m != 'sign']
+        sign_mods = _fetch_oca_sign(version, addons_dir)
+        for m in sign_mods:
+            if m not in mod_list:
+                mod_list.append(m)
+        log(f'[deploy] {container}: firma digital (OCA) → {sign_mods}')
+
+    if 'payroll' in mod_list and version in ('16', '17', '18', '19'):
+        _set_stage(container, 'Preparando módulo de nómina...')
+        own_src = os.path.join(MODULES_DIR, str(version))
+        has_own_payroll = os.path.isfile(os.path.join(own_src, 'payroll', '__manifest__.py'))
+        if has_own_payroll:
+            for m in ('payroll', 'payroll_account'):
+                mod_src = os.path.join(own_src, m)
+                if os.path.isfile(os.path.join(mod_src, '__manifest__.py')) and not os.path.exists(os.path.join(addons_dir, m)):
+                    run(f'cp -r {mod_src} {addons_dir}/')
+                if m not in mod_list:
+                    mod_list.append(m)
+            log(f'[deploy] {container}: nómina copiada desde repo propio (payroll, payroll_account)')
+        else:
+            payroll_mods = _fetch_oca_payroll(version, addons_dir)
+            for m in payroll_mods:
+                if m not in mod_list:
+                    mod_list.append(m)
+            log(f'[deploy] {container}: nómina (OCA, fallback) → {payroll_mods}')
+
+    if 'helpdesk' in mod_list and version in ('16', '17', '18', '19'):
+        _set_stage(container, 'Descargando mesa de ayuda (OCA)...')
+        mod_list = [m for m in mod_list if m != 'helpdesk']
+        helpdesk_mods = _fetch_oca_helpdesk(version, addons_dir)
+        for m in helpdesk_mods:
+            if m not in mod_list:
+                mod_list.append(m)
+        log(f'[deploy] {container}: soporte (OCA) → {helpdesk_mods}')
+
+    if MODULES_REPO:
+        # Módulos retirados: siguen en el repo pero NO se copian a ningún
+        # deploy nuevo (ss_enterprise_theme se retiró por un bug; su
+        # reemplazo home_theme va preinstalado arriba).
+        _retired = {'ss_enterprise_theme'}
+        repo_src = os.path.join(MODULES_DIR, str(version))
+        if not os.path.isdir(repo_src):
+            _sync_custom_modules()
+        if os.path.isdir(repo_src):
+            for entry in os.listdir(repo_src):
+                if entry in _retired or entry in mod_list or os.path.exists(os.path.join(addons_dir, entry)):
+                    continue
+                if os.path.exists(os.path.join(repo_src, entry, '__manifest__.py')):
+                    run(f'cp -r {os.path.join(repo_src, entry)} {addons_dir}/')
+            log(f'[deploy] {container}: resto de módulos propios copiados a addons (disponibles gratis en Apps)')
+
+    return mod_list
 
 
 OM_ACCOUNT_REPO  = 'https://github.com/odoomates/odooapps.git'
@@ -2347,6 +2450,7 @@ class NuqleoHandler(BaseHTTPRequestHandler):
         path = self.path.split('?')[0]
 
         if   path == '/deploy':           self._handle_deploy(body)
+        elif path == '/redeploy':         self._handle_redeploy(body)
         elif path == '/module/upload':    self._handle_module_upload(body)
         elif path == '/module/install-from-repo': self._handle_module_install_from_repo(body)
         elif path == '/module/sync-catalog': self._handle_module_sync_catalog(body)
@@ -3126,6 +3230,104 @@ networks:
                 _set_stage(container, f'ERROR inesperado: {str(e)[:150]}')
 
         threading.Thread(target=_do_deploy_safe, daemon=True).start()
+
+    # ── Redeploy Odoo (reset completo) ─────────────────────────────
+    def _handle_redeploy(self, body: dict):
+        """Borra la BD actual del deployment y la recrea desde cero (como un
+        Odoo recién desplegado), con los módulos que el cliente elija esta vez.
+        Pensado para que el cliente se autoresuelva una instancia rota/atascada
+        sin abrir un ticket de soporte (2026-07-13) — es DESTRUCTIVO: toda la
+        data de la BD vieja (contactos, ventas, documentos) se pierde. El
+        contenedor, puerto, dominio y SSL ya configurados NO se tocan."""
+        container = _sanitize_name(body.get('container_name', ''))
+        db_name   = _sanitize_name(body.get('db_name', ''))
+        version   = _sanitize_name(body.get('odoo_version', '18'))
+        port      = int(body.get('odoo_port', 0))
+        modules   = re.sub(r'[^a-z0-9_,]', '', str(body.get('modules', '')).lower())
+        lang      = re.sub(r'[^a-zA-Z_]', '', str(body.get('lang', 'es_CO')))[:10] or 'es_CO'
+        fiscal    = re.sub(r'[^a-z0-9_]', '', str(body.get('fiscal', '')).lower())[:30]
+        public_url = _sanitize_url(body.get('public_url', ''))
+
+        company_info = {
+            'name':  re.sub(r'[\r\n\t]', '', str(body.get('company_name', '')))[:150].strip(),
+            'vat':   re.sub(r'[^A-Za-z0-9.\-\s]', '', str(body.get('company_vat', '')))[:50].strip(),
+            'email': re.sub(r'[\r\n\t]', '', str(body.get('company_email', '')))[:150].strip(),
+        }
+        logo_b64 = str(body.get('company_logo_base64', ''))
+        if logo_b64 and len(logo_b64) <= 4_000_000:
+            company_info['logo_base64'] = logo_b64
+        company_info = {k: v for k, v in company_info.items() if v}
+
+        if not container or not db_name:
+            return self._send(400, {'error': 'container_name y db_name son requeridos'})
+        if version not in ALLOWED_ODOO_VERSIONS:
+            return self._send(400, {'error': f'Versión Odoo no permitida. Válidas: {", ".join(sorted(ALLOWED_ODOO_VERSIONS))}'})
+        if not (PORT_MIN <= port <= PORT_MAX):
+            return self._send(400, {'error': f'Puerto fuera de rango ({PORT_MIN}-{PORT_MAX})'})
+
+        deploy_dir = os.path.join(ODOO_DIR, container)
+        addons_dir = os.path.join(deploy_dir, 'addons')
+        odoo_data  = os.path.join(deploy_dir, 'odoo-data')
+        if not os.path.isdir(deploy_dir):
+            return self._send(404, {'error': 'Deployment no encontrado en este servidor'})
+
+        self._send(200, {'ok': True, 'container': container, 'message': f'Redespliegue de {container} iniciado'})
+
+        def _do_redeploy():
+            try:
+                _set_stage(container, 'Deteniendo Odoo para redesplegar...')
+                run(['docker', 'stop', container], timeout=60)
+
+                _set_stage(container, 'Borrando base de datos actual (reset completo)...')
+                if not _drop_db(db_name):
+                    _set_stage(container, 'ERROR: no se pudo borrar la base de datos actual')
+                    run(['docker', 'start', container])
+                    return
+
+                _set_stage(container, 'Creando base de datos limpia...')
+                if not _ensure_template_db(version) or not _create_db_from_template(db_name, version):
+                    _set_stage(container, 'ERROR: no se pudo recrear la base de datos')
+                    return
+                if public_url:
+                    _set_web_base_url(db_name, public_url)
+
+                _set_stage(container, 'Preparando módulos...')
+                if os.path.isdir(addons_dir):
+                    shutil.rmtree(addons_dir, ignore_errors=True)
+                os.makedirs(addons_dir, exist_ok=True)
+                # odoo-data también se limpia — filestore (adjuntos) de la BD vieja
+                # quedaría huérfano si no, y el cliente pidió un reset total, no
+                # solo de la BD.
+                if os.path.isdir(odoo_data):
+                    shutil.rmtree(odoo_data, ignore_errors=True)
+                os.makedirs(os.path.join(odoo_data, 'sessions'), exist_ok=True)
+
+                mod_list = [m for m in modules.split(',') if m]
+                mod_list = _prepare_addons_modules(container, addons_dir, mod_list, version)
+                if fiscal and fiscal not in mod_list:
+                    mod_list.append(fiscal)
+
+                run(f'chown -R 100:101 {odoo_data} {addons_dir}')
+
+                _set_stage(container, 'Reiniciando Odoo...')
+                start_r = run(['docker', 'start', container], timeout=60)
+                if not start_r['ok']:
+                    _set_stage(container, f'ERROR: no se pudo reiniciar el contenedor ({start_r.get("stderr","")[:120]})')
+                    return
+
+                mail_domain = re.sub(r'^https?://', '', public_url).split('/')[0].split(':')[0] if public_url else ''
+                threading.Thread(
+                    target=_install_modules_rpc,
+                    args=(container, db_name, mod_list, port, version, lang, mail_domain, fiscal, company_info),
+                    daemon=True
+                ).start()
+                log(f"[redeploy] {container}: BD recreada, módulos en background: {','.join(mod_list) or 'ninguno'} lang={lang} fiscal={fiscal}")
+            except Exception as e:
+                log(f'[redeploy] {container}: EXCEPCIÓN no controlada — {e}')
+                _set_stage(container, f'ERROR inesperado durante el redespliegue: {str(e)[:150]}')
+                run(['docker', 'start', container])
+
+        threading.Thread(target=_do_redeploy, daemon=True).start()
 
     # ── Upload módulo ─────────────────────────────────────────────
     def _handle_module_upload(self, body: dict):
