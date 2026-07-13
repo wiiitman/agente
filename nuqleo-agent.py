@@ -1171,7 +1171,10 @@ def _swap_to_nocron(container: str, port: int) -> str:
         return ''
 
     # Esperar a que el contenedor temporal responda antes de devolver el control.
-    for _ in range(30):
+    # 90×2s = 3 min: desde que el swap se hace INMEDIATAMENTE tras el compose up
+    # (sin esperar el arranque del principal), este es el arranque en FRÍO de la
+    # BD — tarda 40-80s normalmente, no los ~15s de un simple re-arranque.
+    for _ in range(90):
         r = run(f'curl -sf --max-time 3 -o /dev/null -w "%{{http_code}}" http://127.0.0.1:{port}/web/login 2>/dev/null', timeout=6)
         if r['ok'] and r['stdout'].strip() in ('200', '303'):
             log(f'[nocron] {container}: swap a instancia sin cron OK ({temp_name})')
@@ -1198,55 +1201,64 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
     Espera hasta que Odoo responda, instala módulos, activa idioma y Odoo se reinicia solo."""
     import xmlrpc.client
     url = f'http://127.0.0.1:{port}'
-    # 240s: generoso para que un button_immediate_install del paquete fiscal pesado
-    # (el más lento observado) no se corte en medio de una instalación legítima,
-    # pero acota el peor caso de un socket colgado tras el reinicio de workers.
-    _RPC_TIMEOUT = 240
+    # 600s: desde que TODOS los módulos van en un solo button_immediate_install
+    # (ver abajo), esa única llamada puede tardar 4-6 min con el paquete fiscal
+    # completo — un timeout de 240s la cortaba a la mitad (la instalación seguía
+    # dentro de Odoo, pero el cliente XML-RPC ya la daba por perdida). Sigue
+    # acotando el peor caso de un socket colgado, solo que con más margen.
+    _RPC_TIMEOUT = 600
 
-    # Esperar que Odoo esté listo — espera inicial de 20s (Odoo nunca responde antes),
-    # luego polling cada 3s hasta 5 min. Sin el restart previo Odoo suele estar listo
-    # en 40-80s desde el compose up.
-    _set_stage(container, 'Odoo iniciando — esperando disponibilidad...')
-    time.sleep(20)
-    ready = False
-    for _ in range(100):
-        r = run(f'curl -sf --max-time 3 {url}/web/health 2>/dev/null', timeout=6)
-        if r['ok']:
-            ready = True
-            break
-        r2 = run(f'curl -sf --max-time 3 -o /dev/null -w "%{{http_code}}" {url}/web/login 2>/dev/null', timeout=6)
-        if r2['ok'] and r2['stdout'].strip() in ('200', '303'):
-            ready = True
-            break
-        time.sleep(3)
-
-    if not ready:
-        # Mensaje anterior decía "Odoo listo" incluso cuando Odoo NUNCA respondió
-        # — confuso para el cliente y para soporte. Revisamos el estado real del
-        # contenedor (docker inspect) para dar una pista accionable en vez de un
-        # falso positivo.
-        insp = run(['docker', 'inspect', container, '--format',
-                    '{{.State.Status}}\t{{.RestartCount}}'])
-        docker_state, restarts = 'desconocido', '0'
-        if insp['ok'] and insp['stdout'].strip():
-            parts = insp['stdout'].strip().split('\t')
-            docker_state = parts[0]
-            restarts = parts[1] if len(parts) > 1 else '0'
-        if restarts.isdigit() and int(restarts) >= 3:
-            stage_msg = (f'ERROR: el contenedor se reinicia solo ({restarts}x) — '
-                         f'revisa "docker logs {container}" en el VPS (posible fallo de conexión a la BD)')
-        else:
-            stage_msg = f'Odoo no respondió en 4min (docker: {docker_state}) — revisar logs del contenedor'
-        log(f'[rpc] {container}: Odoo no respondió en 4min, módulos pendientes (docker={docker_state}, restarts={restarts})')
-        _set_stage(container, stage_msg)
-        return False
-
+    # Swap INMEDIATO a la instancia gemela sin cron (ver _swap_to_nocron) — sin
+    # esperar primero a que el contenedor principal termine de arrancar. Antes
+    # se hacía: sleep(20) + polling hasta que el principal respondiera (40-80s
+    # de arranque en frío)... para acto seguido DETENERLO y arrancar el gemelo,
+    # que volvía a esperar SU propio arranque. Ese arranque doble quemaba
+    # 60-100s por deploy sin aportar nada: la única espera necesaria es la del
+    # gemelo (la hace _swap_to_nocron por dentro), que es quien realmente
+    # atiende la instalación. Confirmado optimizando tiempos 2026-07-13.
     _set_stage(container, f'Instalando módulos e idioma {lang}...')
-    # Swap a una instancia gemela sin cron para TODA la instalación — ver
-    # _swap_to_nocron. Si el swap falla por cualquier motivo, seguimos contra el
-    # contenedor original (temp_name queda '') aceptando el riesgo de choque en
-    # vez de bloquear el deploy entero por esto.
     temp_name = _swap_to_nocron(container, port)
+
+    if not temp_name:
+        # Fallback: el swap falló — seguimos contra el contenedor original como
+        # antes (aceptando el riesgo de choque con el cron), y ahora SÍ hay que
+        # esperar a que ese contenedor original esté listo.
+        _set_stage(container, 'Odoo iniciando — esperando disponibilidad...')
+        time.sleep(20)
+        ready = False
+        for _ in range(100):
+            r = run(f'curl -sf --max-time 3 {url}/web/health 2>/dev/null', timeout=6)
+            if r['ok']:
+                ready = True
+                break
+            r2 = run(f'curl -sf --max-time 3 -o /dev/null -w "%{{http_code}}" {url}/web/login 2>/dev/null', timeout=6)
+            if r2['ok'] and r2['stdout'].strip() in ('200', '303'):
+                ready = True
+                break
+            time.sleep(3)
+
+        if not ready:
+            # Mensaje anterior decía "Odoo listo" incluso cuando Odoo NUNCA respondió
+            # — confuso para el cliente y para soporte. Revisamos el estado real del
+            # contenedor (docker inspect) para dar una pista accionable en vez de un
+            # falso positivo.
+            insp = run(['docker', 'inspect', container, '--format',
+                        '{{.State.Status}}\t{{.RestartCount}}'])
+            docker_state, restarts = 'desconocido', '0'
+            if insp['ok'] and insp['stdout'].strip():
+                parts = insp['stdout'].strip().split('\t')
+                docker_state = parts[0]
+                restarts = parts[1] if len(parts) > 1 else '0'
+            if restarts.isdigit() and int(restarts) >= 3:
+                stage_msg = (f'ERROR: el contenedor se reinicia solo ({restarts}x) — '
+                             f'revisa "docker logs {container}" en el VPS (posible fallo de conexión a la BD)')
+            else:
+                stage_msg = f'Odoo no respondió en 4min (docker: {docker_state}) — revisar logs del contenedor'
+            log(f'[rpc] {container}: Odoo no respondió en 4min, módulos pendientes (docker={docker_state}, restarts={restarts})')
+            _set_stage(container, stage_msg)
+            return False
+
+        _set_stage(container, f'Instalando módulos e idioma {lang}...')
     try:
         _rpc_transport = _TimeoutTransport(_RPC_TIMEOUT)
         common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True, transport=_rpc_transport)
@@ -1255,23 +1267,6 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
             raise RuntimeError('auth falló con admin/admin')
 
         models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True, transport=_rpc_transport)
-
-        # Módulos propios de tema/UX de Nuqleo — livianos y sin datos pesados,
-        # se instalan primero para que el cliente vea la marca Nuqleo apenas entra.
-        THEME_MODS = {'nuqleo_apps_filter', 'home_theme'}
-        # Paquete fiscal/contable — el más pesado y el que más choca con locks de
-        # Postgres (carga el plan de cuentas completo, impuestos, etc. — cientos de
-        # registros). Confirmado en vivo 2026-07-13: meter esto en el mismo lote que
-        # todo lo demás hacía que UN solo conflicto de concurrencia tirara el
-        # deploy ENTERO sin entregar nada al cliente en 5-10 minutos. Se instala de
-        # último, en su propia etapa, DESPUÉS de que el cliente ya tiene un Odoo
-        # usable (idioma + tema + su módulo de negocio elegido).
-        HEAVY_FISCAL_MODS = {'account', 'om_account_accountant', 'accounting_pdf_reports',
-                              'om_account_daily_reports', 'om_recurring_payments',
-                              'om_account_asset', 'om_account_budget', 'om_account_followup',
-                              'om_fiscal_year'}
-        def _is_heavy(name: str) -> bool:
-            return name in HEAVY_FISCAL_MODS or name.startswith('l10n_')
 
         # 0. Correo saliente vía Postfix local del VPS (best-effort, no aborta el deploy).
         _configure_local_mail_server(models, uid, db_name, domain)
@@ -1388,11 +1383,14 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
                     raise
                 log(f'[rpc] {container}: conexión cortada/expirada durante "{label}" '
                     f'(normal, Odoo reinicia workers) — se continúa esperando que vuelva')
-            # button_immediate_install reinicia los workers de Odoo internamente.
-            # Hay que esperar a que Odoo vuelva antes de continuar con la siguiente etapa.
+            # Esperar a que Odoo vuelva a responder tras la instalación. Con
+            # --workers=0 el proceso no muere (solo recarga el registry), así que
+            # normalmente responde enseguida — pero si el RPC se cortó por timeout
+            # con la instalación aún corriendo dentro de Odoo, este loop es lo que
+            # espera a que termine de verdad: 100×3s = 5 min de margen.
             log(f'[rpc] {container}: esperando que Odoo vuelva tras "{label}"...')
-            time.sleep(8)
-            for _ in range(30):
+            time.sleep(3)
+            for _ in range(100):
                 try:
                     new_uid = common.authenticate(db_name, 'admin', 'admin', {})
                     if new_uid:
@@ -1450,20 +1448,16 @@ def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: in
             except Exception as le:
                 log(f'[rpc] {container}: idioma {lang} FALLÓ: {le}')
 
-        # 2. Tema/UX propio de Nuqleo — liviano, da la marca Nuqleo de una vez.
-        theme_mods = [m for m in mods_list if m in THEME_MODS]
-        _install_group(theme_mods, 'tema y accesos de Nuqleo')
-
-        # 3. Módulo(s) de negocio que el cliente eligió en el wizard (sale, project,
-        #    lo que sea) — el Odoo "tradicional" que el cliente espera ver rápido.
-        base_mods = [m for m in mods_list if m not in THEME_MODS and not _is_heavy(m)]
-        _install_group(base_mods, 'tus módulos de negocio')
-
-        # 4. Paquete fiscal/contable — de ÚLTIMO porque es el más lento y el más
-        #    propenso a chocar con locks (ver comentario en HEAVY_FISCAL_MODS
-        #    arriba). Para esta altura el cliente YA tiene un Odoo usable.
-        heavy_mods = [m for m in mods_list if _is_heavy(m)]
-        _install_group(heavy_mods, 'paquete contable/fiscal (puede tardar más)')
+        # 2. TODOS los módulos en UN solo button_immediate_install. Las 3 etapas
+        #    separadas (tema → negocio → fiscal) existían para aislar los choques
+        #    de concurrencia del cron/multi-worker — que ya NO existen dentro del
+        #    gemelo sin cron con --workers=0 (un solo proceso, un solo registry).
+        #    Cada etapa extra costaba una recarga completa del registry + una
+        #    recompilación de assets JS (~30-60s cada una): fusionarlas recorta
+        #    1-2 minutos por deploy. Odoo resuelve el orden del grafo solo, y si
+        #    algo falla, los reintentos retoman desde lo ya commiteado igual que
+        #    antes (ver _install_group).
+        _install_group(list(mods_list), 'tus módulos e idioma')
 
         # Reinicio final tras instalar módulos + idioma: Odoo sirve los bundles de
         # JS/QWeb (web.assets_backend) tal como estaban compilados en el momento de
