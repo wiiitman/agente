@@ -1494,6 +1494,92 @@ def _pg_dump_db(db_name: str, out_path: str) -> bool:
     r = run(f'docker exec {SHARED_PG_NAME} pg_dump -U odoo {db_name} > {out_path}', timeout=180)
     return r['ok'] and os.path.exists(out_path) and os.path.getsize(out_path) > 0
 
+
+# Módulos/prefijos técnicos de Odoo base que NO aportan nada útil para
+# desarrollar un módulo a medida — se excluyen de la introspección para que el
+# contexto que recibe la IA se centre en lo que el cliente realmente instaló
+# (sale, account, l10n_co, o sus propios módulos custom), no en el andamiaje
+# interno de Odoo (auth, bus, mail, portal, etc.) que la IA ya conoce de sobra.
+_ODOO_CORE_MODULE_PREFIXES = (
+    'base', 'web', 'mail', 'bus', 'portal', 'http_routing', 'web_editor',
+    'web_tour', 'base_setup', 'base_import', 'base_automation', 'resource',
+    'uom', 'utm', 'digest', 'iap', 'phone_validation', 'onboarding',
+    'auth_', 'snailmail', 'privacy', 'partner_autocomplete', 'social_media',
+    'html_editor', 'attachment_indexation', 'rating', 'sms', 'website',
+)
+_ODOO_CORE_MODEL_PREFIXES = (
+    'ir.', 'res.', 'mail.', 'bus.', 'base.', 'web_editor.', 'web_tour.',
+    'auth_', 'onboarding.', 'resource.', 'utm.', 'digest.', 'iap.',
+    'phone.blacklist', 'privacy.', 'rating.', 'sms.', 'report.',
+)
+
+
+def _odoo_introspect(container: str) -> dict:
+    """Lee, vía XML-RPC, qué tiene instalado un Odoo YA desplegado del cliente:
+    módulos instalados (excluyendo el andamiaje técnico de Odoo) y, para esos
+    módulos, sus modelos con los campos principales. Pensado para dar contexto
+    real al chat de desarrollo de módulos ('quiero un módulo para mi Odoo') en
+    vez de que la IA adivine nombres de modelos/campos que quizás no existen
+    en ESA instancia específica."""
+    port = _get_odoo_port(container)
+    if not port:
+        return {'ok': False, 'error': 'contenedor no encontrado o sin puerto publicado'}
+    db_name = _derive_db_name(container)
+    url = f'http://127.0.0.1:{port}'
+
+    try:
+        transport = _TimeoutTransport(30)
+        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True, transport=transport)
+        uid = common.authenticate(db_name, 'admin', 'admin', {})
+        if not uid:
+            return {'ok': False, 'error': 'no se pudo autenticar contra la instancia'}
+        models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True, transport=transport)
+
+        mod_ids = models.execute_kw(db_name, uid, 'admin', 'ir.module.module', 'search',
+                                     [[['state', '=', 'installed']]])
+        mod_recs = models.execute_kw(db_name, uid, 'admin', 'ir.module.module', 'read',
+                                      [mod_ids, ['name', 'shortdesc']])
+        custom_mods = [m for m in mod_recs if not m['name'].startswith(_ODOO_CORE_MODULE_PREFIXES)]
+        custom_names = {m['name'] for m in custom_mods}
+
+        # Modelos definidos por esos módulos (vía ir.model.data, que registra qué
+        # módulo creó cada registro — incluye modelos con nombre ir.model.xxxx).
+        model_data_ids = models.execute_kw(
+            db_name, uid, 'admin', 'ir.model.data', 'search',
+            [[['model', '=', 'ir.model'], ['module', 'in', list(custom_names)]]]
+        )
+        model_res_ids = [d['res_id'] for d in models.execute_kw(
+            db_name, uid, 'admin', 'ir.model.data', 'read', [model_data_ids, ['res_id']])]
+
+        model_recs = []
+        if model_res_ids:
+            raw_models = models.execute_kw(db_name, uid, 'admin', 'ir.model', 'read',
+                                            [model_res_ids, ['model', 'name']])
+            raw_models = [m for m in raw_models if not m['model'].startswith(_ODOO_CORE_MODEL_PREFIXES)]
+            # Tope de 40 modelos: suficiente contexto sin disparar el tamaño del
+            # prompt si el cliente tiene decenas de módulos custom instalados.
+            for mrec in raw_models[:40]:
+                field_ids = models.execute_kw(
+                    db_name, uid, 'admin', 'ir.model.fields', 'search',
+                    [[['model', '=', mrec['model']], ['store', '=', True]]]
+                )
+                fields = models.execute_kw(db_name, uid, 'admin', 'ir.model.fields', 'read',
+                                            [field_ids, ['name', 'field_description', 'ttype']])
+                model_recs.append({
+                    'model': mrec['model'],
+                    'name': mrec['name'],
+                    'fields': [{'name': f['name'], 'label': f['field_description'], 'type': f['ttype']}
+                               for f in fields if not f['name'].startswith('__')][:25],
+                })
+
+        return {
+            'ok': True,
+            'modules': [{'name': m['name'], 'label': m['shortdesc']} for m in custom_mods],
+            'models': model_recs,
+        }
+    except Exception as e:
+        return {'ok': False, 'error': str(e)[:200]}
+
 def _pg_restore_db(db_name: str, sql_path: str) -> bool:
     """Recrea la BD desde un dump previo — usado para revertir un módulo que rompió Odoo."""
     if not os.path.exists(sql_path) or os.path.getsize(sql_path) == 0:
@@ -2133,6 +2219,16 @@ class NuqleoHandler(BaseHTTPRequestHandler):
             self._send(200, {'ok': True, 'container': cname, 'state': state,
                              'health': health, 'port': odoo_port, 'ready': web_ready,
                              'stage': _deploy_stages.get(cname, '')})
+
+        elif self.path.startswith('/odoo-introspect/'):
+            # Contexto real para el chat de desarrollo de módulos ('quiero un
+            # módulo para mi Odoo') — ver _odoo_introspect. Solo lectura, no
+            # toca nada del contenedor ni de la BD del cliente.
+            cname = _sanitize_name(self.path[len('/odoo-introspect/'):])
+            if not cname:
+                return self._send(400, {'error': 'container requerido'})
+            result = _odoo_introspect(cname)
+            self._send(200 if result.get('ok') else 502, result)
 
         elif self.path.startswith('/resources/'):
             # Uso de RAM/CPU/disco de una instancia — endpoint aparte y bajo demanda
