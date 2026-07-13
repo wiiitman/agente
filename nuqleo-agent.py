@@ -1196,7 +1196,29 @@ def _swap_back(temp_name: str, container: str):
     log(f'[nocron] {container}: instancia sin cron apagada, contenedor original restaurado')
 
 
+# Cola de instalaciones: máximo 2 simultáneas por VPS. Un install de Odoo
+# (registry + assets + datos del plan contable) satura 1-2 núcleos por sí solo
+# — confirmado 2026-07-13: UN install pesado ya dejaba el VPS con SSH lento.
+# Sin límite, N clientes desplegando a la vez se degradaban TODOS entre sí
+# (cada install tardaba N veces más). Con la cola, los primeros 2 van a
+# velocidad plena y los demás esperan turno: su contenedor principal ya está
+# arriba (pueden ver el login), solo se pospone la instalación de módulos.
+_INSTALL_SLOTS = threading.Semaphore(2)
+
+
 def _install_modules_rpc(container: str, db_name: str, mods_list: list, port: int, version: str, lang: str = 'es_CO', domain: str = '', fiscal: str = '', company_info: dict = None) -> bool:
+    """Wrapper con cola de _install_modules_rpc_inner — ver _INSTALL_SLOTS."""
+    if not _INSTALL_SLOTS.acquire(blocking=False):
+        log(f'[rpc] {container}: en cola — ya hay 2 instalaciones en curso en este VPS')
+        _set_stage(container, 'En cola — otro despliegue en curso, tu turno en un momento...')
+        _INSTALL_SLOTS.acquire()
+    try:
+        return _install_modules_rpc_inner(container, db_name, mods_list, port, version, lang, domain, fiscal, company_info)
+    finally:
+        _INSTALL_SLOTS.release()
+
+
+def _install_modules_rpc_inner(container: str, db_name: str, mods_list: list, port: int, version: str, lang: str = 'es_CO', domain: str = '', fiscal: str = '', company_info: dict = None) -> bool:
     """Instala módulos e idioma via XML-RPC mientras Odoo está corriendo.
     Espera hasta que Odoo responda, instala módulos, activa idioma y Odoo se reinicia solo."""
     import xmlrpc.client
